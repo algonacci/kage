@@ -50,7 +50,7 @@ impl CliAdapter {
         };
 
         let mut template = template;
-        template.extend(config.extra_args.iter().cloned());
+        template.extend(config.resolved_extra_args());
 
         Ok(Self {
             role,
@@ -209,8 +209,10 @@ mod tests {
 
         assert_eq!(argv[0], "claude");
         assert_eq!(argv[1], "--print");
-        assert!(argv.last().unwrap().contains("/tmp/p.md"));
-        assert!(!argv.last().unwrap().contains("a very long plan"));
+        // Not `last()`: permission flags follow the prompt in the rendered argv.
+        let prompt_arg = argv.iter().find(|a| a.contains("/tmp/p.md")).unwrap();
+        assert!(!prompt_arg.contains("a very long plan"));
+        assert!(!argv.iter().any(|a| a.contains("a very long plan")));
     }
 
     #[test]
@@ -220,7 +222,16 @@ mod tests {
 
         let argv = rendered(&config, "do the thing");
 
-        assert_eq!(argv, vec!["codex", "exec", "do the thing"]);
+        assert_eq!(
+            argv,
+            vec![
+                "codex",
+                "exec",
+                "do the thing",
+                "--sandbox",
+                "workspace-write"
+            ]
+        );
     }
 
     #[test]
@@ -243,6 +254,16 @@ mod tests {
         assert!(rendered(&claude, "x").contains(&"--model".to_string()));
         assert!(rendered(&claude, "x").contains(&"opus-5".to_string()));
         assert!(rendered(&codex, "x").contains(&"-m".to_string()));
+    }
+
+    #[test]
+    fn claude_is_given_write_permission_before_the_prompt() {
+        // Regression guard: without a permission flag the planner runs, thinks, and exits having
+        // written nothing, which the loop can only report as a mysterious empty PLAN.md.
+        let argv = rendered(&RoleConfig::preset(AdapterKind::ClaudeCode), "x");
+
+        let flag = argv.iter().position(|a| a == "--permission-mode").unwrap();
+        assert_eq!(argv[flag + 1], "acceptEdits");
     }
 
     #[test]
@@ -286,7 +307,7 @@ mod tests {
     #[test]
     fn extra_args_land_after_the_generated_arguments() {
         let mut config = RoleConfig::preset(AdapterKind::ClaudeCode);
-        config.extra_args = vec!["--permission-mode".into(), "acceptEdits".into()];
+        config.extra_args = Some(vec!["--permission-mode".into(), "acceptEdits".into()]);
 
         let argv = rendered(&config, "x");
 

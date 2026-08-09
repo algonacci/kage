@@ -62,15 +62,13 @@ Roles are bound to harnesses in `.kage/config.yaml`. The workflow never names a 
 roles:
   planner:
     adapter: claude-code
-    model: opus-5
+    model: opus
 
   executor:
     adapter: opencode
-    model: deepseek-v4-flash
 
   reviewer:
     adapter: codex
-    model: gpt-5.6-sol
 
 loop:
   max_iterations: 3
@@ -98,6 +96,11 @@ executor:
 `{prompt}` is replaced with the instruction and `{prompt_file}` with the path to it. By default the
 prompt is written to a file and the agent is given a one-line pointer, which keeps the command line
 small no matter how large the plan grows. Set `prompt_delivery: arg` or `stdin` to change that.
+
+Leave `model` unset to use whatever the harness is already configured with, which is usually what
+you want with a subscription CLI. A name the harness does not recognise fails the whole run, so only
+set one you have verified with that tool — `claude --model` takes `opus` or `claude-opus-5`, and not
+every spelling of a model id works.
 
 Per-role `timeout_secs` (default 1800) and `extra_args` are available for harness flags Kage does
 not model.

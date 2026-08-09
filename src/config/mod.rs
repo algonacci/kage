@@ -154,18 +154,19 @@ fn starter_config(root: &Path) -> String {
          # Adapters: claude-code | codex | opencode | kamui | command\n\
          version: 1\n\
          \n\
+         # Leave `model` unset to use whatever each harness is already configured with.\n\
+         # A name the harness does not recognise fails the run, so only set one you have\n\
+         # verified with that tool (`claude --model`, `codex -m`, `opencode -m`).\n\
          roles:\n\
          \x20 planner:\n\
          \x20   adapter: claude-code\n\
-         \x20   # model: opus-5\n\
+         \x20   # model: opus\n\
          \n\
          \x20 executor:\n\
          \x20   adapter: opencode\n\
-         \x20   # model: deepseek-v4-flash\n\
          \n\
          \x20 reviewer:\n\
          \x20   adapter: codex\n\
-         \x20   # model: gpt-5.6-sol\n\
          \n\
          # Any binary that takes a prompt can fill a role:\n\
          #\n\

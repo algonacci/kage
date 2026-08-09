@@ -84,9 +84,14 @@ pub struct RoleConfig {
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// Appended verbatim after the generated arguments. This is the escape hatch for harness flags
-    /// Kage does not model (`--permission-mode`, `--sandbox`, and friends).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_args: Vec<String>,
+    /// Kage does not model.
+    ///
+    /// Left out, the adapter's own defaults apply — the flags each harness needs to run unattended.
+    /// An explicit `extra_args: []` means "none", which is how a user turns those off. A plain
+    /// `Vec` could not tell those two apart, and every config that spells its roles out would have
+    /// silently lost its permission flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
@@ -104,9 +109,21 @@ impl RoleConfig {
             command: None,
             prompt_delivery: PromptDelivery::default(),
             timeout_secs: default_timeout_secs(),
-            extra_args: adapter.default_extra_args(),
+            extra_args: None,
             env: BTreeMap::new(),
         }
+    }
+}
+
+impl RoleConfig {
+    /// The flags actually appended to this role's argv.
+    ///
+    /// Falls back to the adapter's unattended-run defaults when the config says nothing, so a user
+    /// who spells out `adapter: claude-code` still gets the permission flag that lets it write.
+    pub fn resolved_extra_args(&self) -> Vec<String> {
+        self.extra_args
+            .clone()
+            .unwrap_or_else(|| self.adapter.default_extra_args())
     }
 }
 
@@ -131,11 +148,18 @@ impl AdapterKind {
     ///
     /// Without these the harness stops mid-run waiting for a human to approve an edit, and the
     /// orchestrator hangs until its timeout — the exact failure the loop exists to avoid.
-    fn default_extra_args(self) -> Vec<String> {
+    pub fn default_extra_args(self) -> Vec<String> {
         match self {
+            // Without this the planner cannot write PLAN.md: `claude --print` denies file writes
+            // and there is nobody to approve them, so the run dies having produced nothing.
+            // `acceptEdits` permits edits without touching the shell-command guard.
+            Self::ClaudeCode => vec!["--permission-mode".to_string(), "acceptEdits".to_string()],
+            // Codex defaults to a read-only sandbox; writing is scoped to the worktree it runs in.
+            Self::Codex => vec!["--sandbox".to_string(), "workspace-write".to_string()],
             // Kamui gates every tool call behind a prompt unless told otherwise.
             Self::Kamui => vec!["--auto-approve".to_string()],
-            _ => Vec::new(),
+            // OpenCode carries out its own edits in `run` mode with no permission flag.
+            Self::OpenCode | Self::Command => Vec::new(),
         }
     }
 }
@@ -268,6 +292,39 @@ mod tests {
     }
 
     #[test]
+    fn a_role_spelled_out_in_yaml_still_gets_its_permission_flags() {
+        // The bug this guards: `extra_args` used to be a plain Vec, so a config that named its
+        // roles explicitly deserialized to an empty list and lost the flag that lets the harness
+        // write its deliverable. Every hand-written config was silently broken.
+        let config: Config = serde_yaml_ng::from_str(
+            "roles:
+  planner:
+    adapter: claude-code
+",
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.roles.planner.resolved_extra_args(),
+            vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_explicit_empty_list_turns_the_defaults_off() {
+        let config: Config = serde_yaml_ng::from_str(
+            "roles:
+  planner:
+    adapter: claude-code
+    extra_args: []
+",
+        )
+        .unwrap();
+
+        assert!(config.roles.planner.resolved_extra_args().is_empty());
+    }
+
+    #[test]
     fn a_misspelled_key_is_rejected_rather_than_ignored() {
         // Silently dropping `max_iteration` would let a run loop three times when the user asked
         // for one, so unknown keys are a hard error.
@@ -277,9 +334,26 @@ mod tests {
     }
 
     #[test]
-    fn kamui_is_preset_to_run_unattended() {
-        let role = RoleConfig::preset(AdapterKind::Kamui);
-
-        assert_eq!(role.extra_args, vec!["--auto-approve".to_string()]);
+    fn every_harness_that_needs_permission_is_preset_to_run_unattended() {
+        // A harness that stops to ask permission cannot write its deliverable, and there is nobody
+        // in a non-interactive run to answer. Each of these was read from the tool's own --help.
+        assert_eq!(
+            RoleConfig::preset(AdapterKind::ClaudeCode).resolved_extra_args(),
+            vec!["--permission-mode".to_string(), "acceptEdits".to_string()]
+        );
+        assert_eq!(
+            RoleConfig::preset(AdapterKind::Codex).resolved_extra_args(),
+            vec!["--sandbox".to_string(), "workspace-write".to_string()]
+        );
+        assert_eq!(
+            RoleConfig::preset(AdapterKind::Kamui).resolved_extra_args(),
+            vec!["--auto-approve".to_string()]
+        );
+        // OpenCode edits without asking, so an invented flag would only break the spawn.
+        assert!(
+            RoleConfig::preset(AdapterKind::OpenCode)
+                .resolved_extra_args()
+                .is_empty()
+        );
     }
 }

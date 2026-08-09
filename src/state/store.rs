@@ -88,15 +88,61 @@ pub fn resolve(project: &Project, run_id: Option<&str>) -> Result<RunState> {
 }
 
 /// Per-run artifact paths. Agents read and write these files; Kage only decides where they live.
+///
+/// Where they live is not a free choice. Coding agents sandbox themselves to their working
+/// directory, so when a run is isolated the artifacts have to sit *inside* the worktree or the
+/// agent cannot read its own prompt or write its deliverable — the harness refuses before the model
+/// gets a say. But the worktree is disposable, and `kage status` must still work after `kage clean`
+/// removes it. So agents work against a copy in the worktree that is mirrored back to the project's
+/// own run directory after every phase.
 pub struct Artifacts {
+    /// Where agents read and write. Inside the worktree for an isolated run.
     pub dir: PathBuf,
+    /// The durable copy under the project's `.kage/runs/`, when that is a different place.
+    mirror: Option<PathBuf>,
 }
 
 impl Artifacts {
+    /// The project's own run directory, with no worktree involved. This is what `kage status` reads.
     pub fn new(project: &Project, run_id: &str) -> Self {
         Self {
             dir: project.run_dir(run_id),
+            mirror: None,
         }
+    }
+
+    /// The pair of locations a running phase uses, given where its agents will actually run.
+    pub fn for_run(project: &Project, run_id: &str, workdir: &Path) -> Self {
+        let canonical = project.run_dir(run_id);
+
+        // Not isolated: the agent's working directory already contains the run directory.
+        if workdir == project.root {
+            return Self {
+                dir: canonical,
+                mirror: None,
+            };
+        }
+
+        Self {
+            dir: workdir
+                .join(crate::config::KAGE_DIR)
+                .join("runs")
+                .join(run_id),
+            mirror: Some(canonical),
+        }
+    }
+
+    /// Copy every artifact back to the durable location.
+    ///
+    /// Called after each phase rather than at the end of the run, so a crash mid-loop still leaves
+    /// a readable plan and review behind — which is exactly when someone needs them.
+    pub fn sync(&self) -> Result<()> {
+        let Some(mirror) = &self.mirror else {
+            return Ok(());
+        };
+
+        copy_tree(&self.dir, mirror)
+            .with_context(|| format!("cannot mirror artifacts to {}", mirror.display()))
     }
 
     pub fn request(&self) -> PathBuf {
@@ -132,7 +178,12 @@ impl Artifacts {
     }
 
     pub fn ensure_dirs(&self) -> Result<()> {
-        for dir in [self.dir.clone(), self.prompts_dir(), self.logs_dir()] {
+        let mut dirs = vec![self.dir.clone(), self.prompts_dir(), self.logs_dir()];
+        if let Some(mirror) = &self.mirror {
+            dirs.push(mirror.clone());
+        }
+
+        for dir in dirs {
             std::fs::create_dir_all(&dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
@@ -151,6 +202,27 @@ impl Artifacts {
             ),
         }
     }
+}
+
+/// Recursively copy `from` over `to`, creating directories as needed.
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    if !from.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(to)?;
+
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,6 +283,65 @@ mod tests {
 
         assert_eq!(resolve(&project, None).unwrap().id, "run_20260809_002");
         assert!(resolve(&project, Some("run_nope")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_isolated_run_keeps_its_artifacts_inside_the_worktree() {
+        // The bug this guards: agents run with the worktree as their working directory and sandbox
+        // themselves to it, so artifacts in the project's own .kage/ are unreachable — the harness
+        // refuses to read the prompt or write the plan, and every isolated run dies at PLAN.
+        let (root, project) = project("isolated");
+        let worktree = root.join(".kage/worktrees/run_1");
+
+        let artifacts = Artifacts::for_run(&project, "run_1", &worktree);
+
+        assert!(
+            artifacts.plan().starts_with(&worktree),
+            "agents cannot reach {}",
+            artifacts.plan().display()
+        );
+        assert!(artifacts.prompts_dir().starts_with(&worktree));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_non_isolated_run_writes_straight_to_the_project() {
+        let (root, project) = project("plain");
+
+        let artifacts = Artifacts::for_run(&project, "run_1", &project.root);
+
+        assert_eq!(artifacts.plan(), project.run_dir("run_1").join("PLAN.md"));
+        assert!(artifacts.sync().is_ok(), "nothing to mirror");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn artifacts_survive_the_worktree_being_deleted() {
+        // `kage clean` removes the checkout; `kage status` must still show the plan and review.
+        let (root, project) = project("mirror");
+        let worktree = root.join(".kage/worktrees/run_1");
+        let artifacts = Artifacts::for_run(&project, "run_1", &worktree);
+        artifacts.ensure_dirs().unwrap();
+
+        std::fs::write(artifacts.plan(), "# Objective\nship it").unwrap();
+        std::fs::write(artifacts.logs_dir().join("planner.log"), "output").unwrap();
+        artifacts.sync().unwrap();
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+
+        let durable = Artifacts::new(&project, "run_1");
+        assert_eq!(
+            std::fs::read_to_string(durable.plan()).unwrap(),
+            "# Objective\nship it"
+        );
+        assert!(
+            durable.logs_dir().join("planner.log").is_file(),
+            "nested directories must be mirrored too"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

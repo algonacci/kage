@@ -13,6 +13,13 @@ use crate::git;
 /// against — so an oversized diff is truncated and labelled as such.
 const MAX_DIFF_CHARS: usize = 120_000;
 
+/// Keep Kage's own run directory out of the diff.
+///
+/// An isolated run writes its plan, review, and prompts inside the worktree so the agents can reach
+/// them. Without this the reviewer would be shown its own artifacts as if the executor had authored
+/// them, and every run would look like it touched `.kage/`.
+const EXCLUDE_KAGE: &str = ":(exclude).kage";
+
 /// Everything that changed since `base_commit`, committed or not.
 ///
 /// Agents are inconsistent about committing: some commit each step, some leave everything in the
@@ -22,9 +29,13 @@ const MAX_DIFF_CHARS: usize = 120_000;
 pub async fn since(workdir: &Path, base_commit: &str) -> Result<String> {
     // Recording intent-to-add stages nothing and changes no file contents; it only makes untracked
     // paths visible to `git diff`.
-    let _ = git::git(workdir, &["add", "--all", "--intent-to-add"]).await;
+    let _ = git::git(
+        workdir,
+        &["add", "--all", "--intent-to-add", "--", ".", EXCLUDE_KAGE],
+    )
+    .await;
 
-    let diff = git::git(workdir, &["diff", base_commit]).await?;
+    let diff = git::git(workdir, &["diff", base_commit, "--", ".", EXCLUDE_KAGE]).await?;
 
     if diff.trim().is_empty() {
         return Ok("_(no changes were made)_".to_string());
@@ -35,11 +46,18 @@ pub async fn since(workdir: &Path, base_commit: &str) -> Result<String> {
 
 /// A one-line-per-file summary, for terminal output where a full diff would drown the user.
 pub async fn stat(workdir: &Path, base_commit: &str) -> Result<String> {
-    let _ = git::git(workdir, &["add", "--all", "--intent-to-add"]).await;
-    Ok(git::git(workdir, &["diff", "--stat", base_commit])
-        .await?
-        .trim()
-        .to_string())
+    let _ = git::git(
+        workdir,
+        &["add", "--all", "--intent-to-add", "--", ".", EXCLUDE_KAGE],
+    )
+    .await;
+    Ok(git::git(
+        workdir,
+        &["diff", "--stat", base_commit, "--", ".", EXCLUDE_KAGE],
+    )
+    .await?
+    .trim()
+    .to_string())
 }
 
 fn truncate(diff: &str) -> String {
@@ -116,6 +134,23 @@ mod tests {
         let diff = since(&root, &base).await.unwrap();
 
         assert!(diff.contains("committed change"), "{diff}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn kage_own_artifacts_stay_out_of_the_diff() {
+        // An isolated run writes its plan inside the worktree. Showing that to the reviewer would
+        // present Kage's own scaffolding as work the executor did.
+        let (root, base) = repo("exclude-kage").await;
+        std::fs::create_dir_all(root.join(".kage/runs/run_1")).unwrap();
+        std::fs::write(root.join(".kage/runs/run_1/PLAN.md"), "# Objective\n").unwrap();
+        std::fs::write(root.join("real-work.txt"), "the actual change\n").unwrap();
+
+        let diff = since(&root, &base).await.unwrap();
+
+        assert!(diff.contains("real-work.txt"), "{diff}");
+        assert!(!diff.contains("PLAN.md"), "kage artifacts leaked:\n{diff}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

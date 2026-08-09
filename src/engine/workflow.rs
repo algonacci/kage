@@ -34,9 +34,6 @@ pub async fn start(
     options: &Options,
 ) -> Result<RunState> {
     let run_id = project.next_run_id(chrono::Local::now())?;
-    let artifacts = Artifacts::new(project, &run_id);
-    artifacts.ensure_dirs()?;
-
     let max_iterations = options
         .max_iterations
         .unwrap_or(config.loop_config.max_iterations);
@@ -77,12 +74,17 @@ pub async fn start(
         state.base_commit = Some(git::head_commit(&state.workdir).await?);
     }
 
+    // Only now is the working directory known, and with it where artifacts have to live.
+    let artifacts = Artifacts::for_run(project, &run_id, &state.workdir);
+    artifacts.ensure_dirs()?;
+
     // The request is an artifact like any other, so a run directory explains itself later.
     std::fs::write(
         artifacts.request(),
         format!("# Request\n\n{task}\n\nRun: `{run_id}`\n"),
     )
     .context("cannot write REQUEST.md")?;
+    artifacts.sync()?;
 
     store::save(project, &state)?;
     drive(project, config, state).await
@@ -105,6 +107,14 @@ pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> 
         state.worktree = Some(restored);
     }
 
+    // A failed or blocked run is terminal, so re-entering the phase it died in is the only way
+    // resuming can do anything at all.
+    if state.phase.is_terminal()
+        && let Some(phase) = state.resume_from.take()
+    {
+        state.phase = phase;
+    }
+
     state.error = None;
     state.transition(state.phase, format!("resumed at `{}`", state.phase));
     store::save(project, &state)?;
@@ -118,7 +128,7 @@ pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> 
 /// re-entering that phase rather than skipping past it. Re-entry is safe because every phase
 /// overwrites its artifact instead of appending.
 async fn drive(project: &Project, config: &Config, mut state: RunState) -> Result<RunState> {
-    let artifacts = Artifacts::new(project, &state.id);
+    let artifacts = Artifacts::for_run(project, &state.id, &state.workdir);
     artifacts.ensure_dirs()?;
 
     let planner = adapters::build(Role::Planner, &config.roles.planner)?;
@@ -127,6 +137,7 @@ async fn drive(project: &Project, config: &Config, mut state: RunState) -> Resul
 
     while !state.phase.is_terminal() {
         store::save(project, &state)?;
+        artifacts.sync()?;
 
         match state.phase {
             Phase::Created => {
@@ -311,6 +322,7 @@ async fn drive(project: &Project, config: &Config, mut state: RunState) -> Resul
         }
     }
 
+    artifacts.sync()?;
     store::save(project, &state)?;
     Ok(state)
 }
@@ -384,7 +396,9 @@ fn banner(state: &RunState, phase: &str, who: &str) {
 
 fn fail(project: &Project, mut state: RunState, reason: String) -> Result<RunState> {
     println!("  failed: {reason}");
+    let _ = Artifacts::for_run(project, &state.id, &state.workdir).sync();
     state.error = Some(reason.clone());
+    state.resume_from = Some(state.phase);
     state.transition(Phase::Failed, reason);
     store::save(project, &state)?;
     Ok(state)
@@ -392,7 +406,9 @@ fn fail(project: &Project, mut state: RunState, reason: String) -> Result<RunSta
 
 fn block(project: &Project, mut state: RunState, reason: String) -> Result<RunState> {
     println!("  blocked: {reason}");
+    let _ = Artifacts::for_run(project, &state.id, &state.workdir).sync();
     state.error = Some(reason.clone());
+    state.resume_from = Some(state.phase);
     state.transition(Phase::Blocked, reason);
     store::save(project, &state)?;
     Ok(state)

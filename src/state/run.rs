@@ -93,6 +93,13 @@ pub struct RunState {
     /// Why a run ended in `Failed` or `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The phase a failed or blocked run was in when it stopped.
+    ///
+    /// `Failed` and `Blocked` are terminal, so without remembering the phase underneath them a
+    /// resumed run has nowhere to go — the loop sees a terminal state and exits having done
+    /// nothing, which is not what `kage status` promises when it suggests resuming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<Phase>,
     #[serde(default)]
     pub history: Vec<Event>,
 }
@@ -113,6 +120,7 @@ impl RunState {
             base_commit: None,
             verdict: None,
             error: None,
+            resume_from: None,
             history: Vec::new(),
         }
     }
