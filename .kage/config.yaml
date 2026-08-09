@@ -1,0 +1,41 @@
+# Kage configuration
+#
+# Roles are bound to harnesses here; the workflow itself never names a model.
+# Adapters: claude-code | codex | opencode | kamui | command
+version: 1
+
+roles:
+  planner:
+    adapter: claude-code
+    model: opus
+
+  executor:
+    adapter: opencode
+    model: opencode/deepseek-v4-flash-free
+
+  reviewer:
+    adapter: codex
+    # model: gpt-5.6-sol
+
+# Any binary that takes a prompt can fill a role:
+#
+#   executor:
+#     adapter: command
+#     command: ["my-agent", "--yolo", "{prompt}"]
+
+loop:
+  # Fix attempts allowed after the first failing review.
+  max_iterations: 3
+
+git:
+  # Run agents in a throwaway worktree instead of your working tree.
+  isolate: true
+  # base: main
+
+# Exit codes, not agent self-reports, decide whether execution succeeded.
+validation:
+  commands:
+    - cargo test
+    - cargo clippy --all-targets -- -D warnings
+    - cargo fmt --check
+  timeout_secs: 900
