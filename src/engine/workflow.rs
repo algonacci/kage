@@ -473,6 +473,15 @@ async fn run_agent(
     prompt: String,
 ) -> Result<crate::adapters::AgentResult> {
     let log_path = artifacts.logs_dir().join(format!("{label}.log"));
+    // Create the file before announcing it (REV-002): the path is printed as an invitation to
+    // tail it, and a `tail -f` issued the moment it appears must not race the spawn that would
+    // otherwise create the file a beat later.
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if !log_path.exists() {
+        let _ = std::fs::File::create(&log_path);
+    }
     // Point the user at the live copy inside the worktree — the one worth tailing — not the
     // mirror, which is only written when the phase ends.
     println!("  log: {}", log_path.display());

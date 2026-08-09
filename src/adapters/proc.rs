@@ -220,9 +220,12 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         Ok(status) => status.context("cannot wait for child process")?,
         Err(_) => {
             timed_out = true;
-            // Kill, then wait: the reader tasks only finish once the pipes close, which only
-            // happens after the process is actually gone.
-            let _ = child.start_kill();
+            // Kill the whole tree, then wait. `start_kill` alone terminates only the direct
+            // child, but coding-agent CLIs spawn helpers (node, MCP servers) that inherit the
+            // stdout pipe; when they outlive the child, the drain tasks keep waiting for EOF and
+            // a run that timed out at 30 minutes sits open for another 49 — observed twice, once
+            // on each role, before this existed.
+            kill_tree(&mut child).await;
             child.wait().await.context("cannot reap timed-out child")?
         }
     };
@@ -233,8 +236,28 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         handle.abort();
     }
 
-    let stdout = stdout_task.await.unwrap_or_default();
-    let stderr = stderr_task.await.unwrap_or_default();
+    // After a kill, a straggler that survived the tree-kill can still hold the pipe open; give
+    // the drains a short grace and then abandon them rather than pinning the run indefinitely.
+    // The live log has already recorded every line as it arrived, so nothing durable is lost —
+    // only the in-memory capture is cut short, on a run whose outcome is already "timed out".
+    let (stdout, stderr) = if timed_out {
+        let stdout = tokio::time::timeout(DRAIN_GRACE, stdout_task)
+            .await
+            .ok()
+            .and_then(|joined| joined.ok())
+            .unwrap_or_default();
+        let stderr = tokio::time::timeout(DRAIN_GRACE, stderr_task)
+            .await
+            .ok()
+            .and_then(|joined| joined.ok())
+            .unwrap_or_default();
+        (stdout, stderr)
+    } else {
+        (
+            stdout_task.await.unwrap_or_default(),
+            stderr_task.await.unwrap_or_default(),
+        )
+    };
 
     if let Some(log) = &log {
         let finished = Outcome {
@@ -382,6 +405,33 @@ impl LogWriter {
 /// Long enough not to clutter a chatty run, short enough that a user does not conclude the terminal
 /// is frozen while the agent thinks.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// How long the drains may keep reading after a timed-out child was killed.
+///
+/// Long enough for the tree-kill to close the pipes and the drains to flush; short enough that the
+/// one straggler taskkill missed cannot turn a 30-minute timeout into an 80-minute wait.
+const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// Kill a timed-out child and, on Windows, its whole process tree.
+///
+/// `taskkill /T` takes down the grandchildren that inherited the stdout pipe, which is what lets
+/// the drain tasks reach EOF promptly. `start_kill` stays as the fallback for a taskkill that is
+/// missing or fails — and as the whole story on Unix, where the drain grace bounds the wait
+/// instead.
+async fn kill_tree(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    let _ = child.start_kill();
+}
 
 /// Whether a tick should print, given how long the child has been quiet.
 ///
@@ -640,6 +690,33 @@ mod tests {
         assert!(outcome.timed_out);
         assert!(!outcome.success());
         assert!(outcome.describe().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_grandchild_holding_the_pipe_cannot_pin_a_timed_out_run() {
+        // The bug this guards: coding-agent CLIs spawn helpers that inherit the stdout pipe.
+        // Killing only the direct child left those helpers alive, the drains waited on their pipe
+        // for EOF, and a run that timed out at 30 minutes sat open for another 49. The tree-kill
+        // plus the drain grace must bound the wait regardless of what survives.
+        let command = if cfg!(windows) {
+            // `start /B` detaches a grandchild that inherits our pipe handles.
+            "start /B ping -n 90 127.0.0.1 & ping -n 90 127.0.0.1"
+        } else {
+            // The backgrounded sleep inherits stdout and outlives its parent shell.
+            "sleep 90 & sleep 90"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.timeout = Duration::from_millis(600);
+
+        let started = std::time::Instant::now();
+        let outcome = run(spawn).await.unwrap();
+
+        assert!(outcome.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the drain waited on a straggler's pipe for {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

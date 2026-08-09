@@ -99,11 +99,14 @@ Invocations verified against each tool's own `--help`, not guessed. They are the
 to drift, which is why any role can override the whole argv with `command:`.
 
 ```text
-claude   --print --output-format stream-json --verbose [--model M] --permission-mode acceptEdits <prompt>
-codex    exec [-m M] --sandbox workspace-write <prompt>
+claude   --print --output-format stream-json --verbose [--model M] <prompt> --permission-mode acceptEdits
+codex    exec [-m M] <prompt> --sandbox workspace-write
 opencode run [-m M] <prompt>
 kamui    -p <prompt> --auto-approve
 ```
+
+The argv order is literal: `extra_args` (the permission flags) are appended *after* the prompt,
+which is how the constructed command actually reads (REV-003 caught this file claiming otherwise).
 
 `--output-format stream-json` is what makes the planning phase observable at all: without it claude
 buffers its entire transcript until exit and the terminal shows nothing for the whole phase.
