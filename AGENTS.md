@@ -246,11 +246,22 @@ something already fixed — and a fixed entry left here is a lie told with autho
   acted on (see the stall decision above), but a harness looping noisily is mechanically
   indistinguishable from one working — telling them apart needs judgment about the output, not a
   clock on it.
+- **A resumed run's recreated worktree starts with no artifacts in it.** `.kage/` is never
+  committed, so a worktree rebuilt on `kage resume` has no `PLAN.md` or `TEST_RESULTS.md`, and a
+  prompt built there embeds their placeholders. The missing `EXECUTION.md` is re-asked for; the
+  others are not restored from the project's mirror, which holds them.
+- **The `# Deferred Tasks` contract has not met a live planner.** The instruction, the extraction,
+  and the surfacing are tested; whether real planners honour the "omit when it fits" rule is
+  exactly the kind of thing a green suite cannot prove. Watch the first oversized run.
 
 ## Where the work stands
 
-Kage has built five of its own features. The loop is reliable enough that the interesting failures
-are no longer in the machinery — they are in how a run is scoped and budgeted.
+Kage has built five of its own features, and the scoping-and-budgeting queue that followed is
+clear: the live log has a readable twin, broken builds and review findings spend separate budgets,
+a silent phase is aborted early, task sizing is declared by the planner at the point of use, and
+cross-repo work is a recorded boundary rather than a pending gap. What remains above is small; the
+next real work is the roadmap's graph engineering, which this file's own rule gates behind the
+loop staying reliable.
 
 Two lessons worth carrying into whatever comes next, both learned the expensive way:
 
