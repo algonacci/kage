@@ -192,10 +192,60 @@ pub fn executor(
     }
 }
 
+/// Ask the executor for the account of work it has already finished, and for nothing else.
+///
+/// Every agent invocation is a fresh process with no memory, so this cannot say "you forgot the
+/// summary" and be understood. It carries the brief and the diff, which is all the executor needs
+/// to describe work it no longer remembers doing.
+pub fn account(
+    workdir: &Path,
+    artifacts: &Artifacts,
+    brief: Brief<'_>,
+    changes: &str,
+    delivery: Delivery,
+) -> String {
+    let brief_block = match brief {
+        Brief::Plan => format!(
+            "## The plan the work was implementing\n\n---\n\n{}\n\n---\n\n",
+            artifacts.read_or_placeholder(&artifacts.plan())
+        ),
+        // The task is an argument to the `format!` below, so braces in user text stay literal
+        // rather than being parsed as the format string's escapes.
+        Brief::Request { task } => format!(
+            "## The task the work was implementing\n\nNo plan was written for this run; this task \
+             is the whole specification.\n\n---\n\n{task}\n\n---\n\n"
+        ),
+    };
+
+    format!(
+        "{}\
+         The implementation is already finished and on disk; this invocation is not asked to \
+         review it. Only the account of the work is missing, and the review cannot proceed \
+         without one, so the only purpose of this invocation is to produce it.\n\n\
+         {}\
+         {brief_block}\
+         ## The changes that were made\n\n---\n\n{changes}\n\n---\n\n\
+         ## Rules\n\n\
+         - Do not change any code, tests, or configuration. The implementation is finished and is \
+           being reviewed; the only output wanted from this invocation is the account.\n\
+         - Do not re-run the build or the tests.\n\
+         - Describe what the diff above actually does, not what you would have done.\n\n\
+         Write the account of the work that was done: what was changed, which plan steps (or which \
+         parts of the task) are done, anything that could not be done, and any place the work \
+         deviated from the brief and why.\n",
+        preamble("executor", workdir),
+        deliverable(
+            delivery,
+            &artifacts.execution(),
+            "the account of the work that was done"
+        ),
+    )
+}
+
 /// Ask the executor to repair specific findings.
 ///
-/// The fix prompt names the issues rather than restating the whole task, because a rewrite is a new
-/// chance to break what already passed. Narrow instructions produce narrow diffs.
+/// The fix prompt names the findings rather than restating the whole task, because a rewrite is a
+/// new chance to break what already passed. Narrow instructions produce narrow diffs.
 pub fn fixer(
     workdir: &Path,
     artifacts: &Artifacts,
@@ -203,6 +253,7 @@ pub fn fixer(
     verdict: &Verdict,
     iteration: usize,
     max_iterations: usize,
+    delivery: Delivery,
 ) -> String {
     let brief_block = match brief {
         Brief::Plan => format!(
@@ -233,7 +284,7 @@ pub fn fixer(
          In your deliverable, record what you changed for each finding, by id.\n",
         preamble("executor", workdir),
         deliverable(
-            Delivery::AgentWrites,
+            delivery,
             &artifacts.execution(),
             "a summary of the fixes you made",
         ),
@@ -455,7 +506,15 @@ mod tests {
         )
         .unwrap();
 
-        let prompt = fixer(&root, &artifacts, Brief::Plan, &verdict, 2, 3);
+        let prompt = fixer(
+            &root,
+            &artifacts,
+            Brief::Plan,
+            &verdict,
+            2,
+            3,
+            Delivery::AgentWrites,
+        );
 
         assert!(prompt.contains("REV-007"));
         assert!(prompt.contains("race on the counter"));
@@ -482,6 +541,7 @@ mod tests {
             &verdict,
             1,
             3,
+            Delivery::AgentWrites,
         );
 
         assert!(prompt.contains("add a health check endpoint"));
@@ -491,6 +551,88 @@ mod tests {
         );
         assert!(prompt.contains("REV-001"));
         assert!(prompt.contains("Do not weaken, skip, or delete a test"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_account_prompt_asks_only_for_the_summary_and_forbids_new_changes() {
+        let (root, artifacts) = artifacts("account");
+        std::fs::write(artifacts.plan(), "# Objective\nShip the widget.").unwrap();
+
+        let prompt = account(
+            &root,
+            &artifacts,
+            Brief::Plan,
+            "diff --git a/src/a.rs b/src/a.rs",
+            Delivery::AgentWrites,
+        );
+
+        assert!(prompt.contains("EXECUTION.md"));
+        assert!(prompt.contains("diff --git a/src/a.rs b/src/a.rs"));
+        assert!(prompt.contains("Do not change any code"));
+        assert!(prompt.contains("Do not re-run the build or the tests"));
+        assert!(
+            !prompt.contains("Implement this plan exactly"),
+            "the account is not an instruction to implement anything:\n{prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_account_prompt_with_no_plan_never_names_the_file_the_run_never_wrote() {
+        let (root, artifacts) = artifacts("account-request");
+
+        let prompt = account(
+            &root,
+            &artifacts,
+            Brief::Request {
+                task: "add a health check endpoint",
+            },
+            "diff",
+            Delivery::AgentWrites,
+        );
+
+        assert!(prompt.contains("add a health check endpoint"));
+        assert!(
+            !prompt.contains("PLAN.md"),
+            "a plan-free account prompt must never name the file the run never wrote:\n{prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_account_prompt_for_a_model_with_no_filesystem_asks_for_a_reply() {
+        let (root, artifacts) = artifacts("account-kage-writes");
+
+        let prompt = account(&root, &artifacts, Brief::Plan, "diff", Delivery::KageWrites);
+
+        assert!(prompt.contains("saved verbatim as `EXECUTION.md`"));
+        assert!(
+            !prompt.contains("to this exact path"),
+            "a model with no filesystem must be asked for a reply, not a file:\n{prompt}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_account_prompt_keeps_braces_in_a_task_literal() {
+        let (root, artifacts) = artifacts("account-braces");
+
+        let prompt = account(
+            &root,
+            &artifacts,
+            Brief::Request {
+                task: "add {n} retries",
+            },
+            "diff",
+            Delivery::AgentWrites,
+        );
+
+        assert!(prompt.contains("add {n} retries"), "{prompt}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -624,7 +766,15 @@ mod tests {
         );
         dump(
             "fixer-plan",
-            fixer(&root, &artifacts, Brief::Plan, &verdict, 1, 3),
+            fixer(
+                &root,
+                &artifacts,
+                Brief::Plan,
+                &verdict,
+                1,
+                3,
+                Delivery::AgentWrites,
+            ),
         );
         dump(
             "fixer-noplan",
@@ -635,6 +785,27 @@ mod tests {
                 &verdict,
                 1,
                 3,
+                Delivery::AgentWrites,
+            ),
+        );
+        dump(
+            "account-plan",
+            account(
+                &root,
+                &artifacts,
+                Brief::Plan,
+                "diff",
+                Delivery::AgentWrites,
+            ),
+        );
+        dump(
+            "account-noplan",
+            account(
+                &root,
+                &artifacts,
+                Brief::Request { task: "TASK {x}" },
+                "diff",
+                Delivery::AgentWrites,
             ),
         );
         dump(

@@ -78,6 +78,13 @@ diff, or the reviewer is shown its own artifacts as the executor's work.
 **Failing validation skips review.** Asking a premium reviewer to judge code that does not build
 spends real money to learn what an exit code already proved.
 
+**The executor's account is enforced like the plan.** A phase that produces `EXECUTION.md` may not
+end without one. When it is missing the executor is asked once more for just the summary — the
+implementation is already on disk and is the expensive artifact, while the account is prose that can
+be rebuilt from the diff — and if that produces nothing the run fails rather than handing the
+reviewer a placeholder where the executor's claims belong. The gate and the placeholder share one
+predicate (`Artifacts::has_content`) so a blank file cannot pass one and trip the other.
+
 **A review with no machine-readable verdict blocks the run.** Guessing PASS lets unreviewed code
 through; guessing FAIL burns an iteration on nothing.
 
@@ -191,8 +198,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **The executor often skips `EXECUTION.md`.** Only `PLAN.md` is enforced, so the reviewer receives
-  a placeholder instead of what the executor claims it did and where it deviated.
 - **The live log is not readable while it is live.** Every raw line is kept deliberately — it is the
   forensic record of what the harness emitted — but a claude planning phase writes hundreds of
   kilobytes of `thinking_tokens` events, so the file cannot serve the human tailing it. One file is

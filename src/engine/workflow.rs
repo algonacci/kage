@@ -304,7 +304,7 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 if let Err(error) = save_reply(delivery, &result, &artifacts.plan()) {
                     return fail(project, state, format!("{error:#}"));
                 }
-                if !artifacts.plan().is_file() {
+                if !artifacts.has_content(&artifacts.plan()) {
                     return fail(
                         project,
                         state,
@@ -319,11 +319,27 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
 
             Phase::Executing => {
                 banner(&state, "EXECUTE", &executor.describe());
+
+                // A previous attempt's account must not be mistaken for this one's — the same
+                // reason the review phase deletes a stale VERDICT.json before re-running.
+                let _ = std::fs::remove_file(artifacts.execution());
+
                 let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
                 let prompt = prompts::executor(&state.workdir, &artifacts, brief(&state), delivery);
 
                 let result = run_agent(&*executor, &state, &artifacts, "executor", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
+                    return fail(project, state, reason);
+                }
+                // The prompt promises "your entire response is saved verbatim as EXECUTION.md"
+                // when Kage is the one writing it; honour that promise, so a KageWrites executor is
+                // never left with an account that only ever existed in the phase's imagination.
+                if let Err(error) = save_reply(delivery, &result, &artifacts.execution()) {
+                    return fail(project, state, format!("{error:#}"));
+                }
+                if let Some(reason) =
+                    ensure_account(&*executor, &state, &artifacts, "executor").await?
+                {
                     return fail(project, state, reason);
                 }
 
@@ -359,6 +375,16 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
             }
 
             Phase::Reviewing => {
+                // The consumer is where the invariant is guaranteed. A `kage resume` can enter this
+                // phase directly, and a resumed run whose worktree was recreated has none of its
+                // artifacts in it — `.kage/` is never committed. On the normal path this is a file
+                // check and costs nothing.
+                if let Some(reason) =
+                    ensure_account(&*executor, &state, &artifacts, "review").await?
+                {
+                    return fail(project, state, reason);
+                }
+
                 banner(&state, "REVIEW", &reviewer.describe());
 
                 let diff = match &state.base_commit {
@@ -448,6 +474,10 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                     &executor.describe(),
                 );
 
+                // The execute phase's account must not be presented as this fix's — the gate
+                // below measures the fix, not the run's first attempt.
+                let _ = std::fs::remove_file(artifacts.execution());
+
                 // Test failures reach this phase with no verdict, so an empty finding list is
                 // normal; the test results in the prompt carry the detail in that case.
                 let verdict = state.verdict.clone().unwrap_or(gates::Verdict {
@@ -459,6 +489,7 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                     issues: Vec::new(),
                 });
 
+                let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
                 let prompt = prompts::fixer(
                     &state.workdir,
                     &artifacts,
@@ -466,11 +497,19 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                     &verdict,
                     state.iteration,
                     state.max_iterations,
+                    delivery,
                 );
 
                 let label = format!("fix-{}", state.iteration);
                 let result = run_agent(&*executor, &state, &artifacts, &label, prompt).await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
+                    return fail(project, state, reason);
+                }
+                if let Err(error) = save_reply(delivery, &result, &artifacts.execution()) {
+                    return fail(project, state, format!("{error:#}"));
+                }
+                if let Some(reason) = ensure_account(&*executor, &state, &artifacts, &label).await?
+                {
                     return fail(project, state, reason);
                 }
 
@@ -517,6 +556,90 @@ fn save_reply(
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
     std::fs::write(path, &result.stdout).with_context(|| format!("cannot write {}", path.display()))
+}
+
+/// The label for the re-ask's prompt and log, derived from the phase that asked.
+///
+/// A distinct name per call site: sharing one would overwrite the log of whichever asked first,
+/// and that log is the only evidence of why the account is missing.
+fn account_label(label: &str) -> String {
+    format!("{label}-account")
+}
+
+/// Why a run stops when the executor will not account for its own work.
+fn missing_account_reason(log: &str) -> String {
+    format!(
+        "the executor finished but wrote no EXECUTION.md, and a second request for just that \
+         summary produced none either — without it the reviewer would be judging the diff against \
+         a placeholder instead of the executor's own claims, so the run stops here rather than \
+         reviewing blind\n\
+         the implementation itself is intact — the closing summary below says where it landed\n\
+         see {log}"
+    )
+}
+
+/// Make sure the executor's account of its own work exists, re-asking once when it does not.
+///
+/// `Ok(None)` means there is an account. `Ok(Some(reason))` means there is not and the caller
+/// should fail the run.
+///
+/// Why re-ask rather than fail outright: by the time this runs the implementation is finished and
+/// on disk, and that is the expensive artifact. The account is prose the executor can reconstruct
+/// from the diff for a fraction of what the implementation cost, so discarding a completed
+/// implementation over a missing summary file is the wrong trade. Why only once: an agent that
+/// ignored a prompt whose entire instruction is "write this file" will not comply on the third
+/// ask, and an unbounded retry turns a bookkeeping failure into an unbounded bill. Why fail after
+/// that, rather than continue: the account is the only place the executor says what it could not
+/// do and where it deviated, and a review conducted against a placeholder is the failure this gate
+/// exists to end. Failing does not throw the work away — `drive` finalizes terminal runs, so the
+/// code is committed to the run's branch and `outcome_hint` prints where it is.
+async fn ensure_account(
+    executor: &dyn AgentAdapter,
+    state: &RunState,
+    artifacts: &Artifacts,
+    label: &str,
+) -> Result<Option<String>> {
+    if artifacts.has_content(&artifacts.execution()) {
+        return Ok(None);
+    }
+
+    println!("  no EXECUTION.md — asking the executor for its account of the work");
+
+    // The same diff the reviewer would get; the account is written against the very thing the
+    // review is going to weigh it against.
+    let diff = match &state.base_commit {
+        Some(base) => git::diff::since(&state.workdir, base)
+            .await
+            .unwrap_or_else(|error| format!("_(could not compute diff: {error})_")),
+        None => "_(not a git repository — no diff available)_".to_string(),
+    };
+
+    let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
+    let prompt = prompts::account(&state.workdir, artifacts, brief(state), &diff, delivery);
+
+    let label = account_label(label);
+    let result = run_agent(executor, state, artifacts, &label, prompt).await?;
+    let log = artifacts.logs_dir().join(format!("{label}.log"));
+
+    if let Some(detail) = agent_failure(&result, "executor") {
+        return Ok(Some(format!(
+            "{}\n{detail}",
+            missing_account_reason(&log.display().to_string())
+        )));
+    }
+
+    if let Err(error) = save_reply(delivery, &result, &artifacts.execution()) {
+        return Ok(Some(format!(
+            "{}\n{error:#}",
+            missing_account_reason(&log.display().to_string())
+        )));
+    }
+
+    if artifacts.has_content(&artifacts.execution()) {
+        Ok(None)
+    } else {
+        Ok(Some(missing_account_reason(&log.display().to_string())))
+    }
 }
 
 /// Spend an iteration on a fix, or report that none remain.
@@ -794,6 +917,26 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_account_names_the_artifact_the_log_and_where_the_work_is() {
+        let reason = missing_account_reason("logs/executor-account.log");
+
+        assert!(reason.contains("EXECUTION.md"));
+        assert!(reason.contains("logs/executor-account.log"));
+        // The user must know that the code survived — the run stopped over a missing prose
+        // file, not over lost work.
+        assert!(reason.contains("intact"), "{reason}");
+    }
+
+    #[test]
+    fn the_account_retry_logs_under_its_own_name() {
+        // Regression guard: a shared label would let the re-ask overwrite the log that recorded
+        // why the account was missing in the first place, and that log is the only evidence left.
+        assert_eq!(account_label("fix-2"), "fix-2-account");
+        assert_eq!(account_label("executor"), "executor-account");
+        assert_eq!(account_label("review"), "review-account");
+    }
+
+    #[test]
     fn the_outcome_hint_names_the_commit_and_how_to_take_it() {
         let mut state = state(3);
         state.base_commit = Some("abc123".to_string());
@@ -906,6 +1049,18 @@ mod tests {
         role
     }
 
+    /// A `command` role that exits 0 and writes nothing, standing in for an executor with no
+    /// account to offer (and no harness installed anywhere on the CI machine).
+    fn role_echo() -> crate::config::RoleConfig {
+        let mut role = crate::config::RoleConfig::preset(crate::config::AdapterKind::Command);
+        role.command = Some(if cfg!(windows) {
+            vec!["cmd".to_string(), "/C".to_string(), "echo done".to_string()]
+        } else {
+            vec!["sh".to_string(), "-c".to_string(), "echo done".to_string()]
+        });
+        role
+    }
+
     /// A fresh project whose planner and executor point at this test binary (guaranteed to exist)
     /// and whose reviewer names a program that cannot be found.
     fn project_with_a_missing_reviewer(
@@ -981,6 +1136,63 @@ mod tests {
             reloaded.history.len(),
             history_len,
             "a blocked resume must record nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_executor_that_writes_no_account_stops_the_run_before_review() {
+        // Regression guard: an executor that exits 0 without writing EXECUTION.md used to move the
+        // run to review anyway, where the reviewer was handed a placeholder where the executor's
+        // claims belong. The gate must spend exactly one extra re-ask — never a fix iteration —
+        // and then fail the run before the reviewer is ever spawned.
+        let root =
+            std::env::temp_dir().join(format!("kage-workflow-account-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::config::init(&root, true).unwrap();
+
+        let project = Project::discover(&root).unwrap();
+        let mut config = project.load_config().unwrap();
+        let echo = role_echo();
+        config.roles.planner = echo.clone();
+        config.roles.executor = echo.clone();
+        config.roles.reviewer = echo;
+        config.loop_config.max_iterations = 0;
+
+        // skip-plan so no PLAN.md is required; the temp directory is not a repository, so the run
+        // works in place with no worktree and no commit to babysit.
+        let state = start(
+            &project,
+            &config,
+            "task",
+            &Options {
+                skip_plan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let artifacts = Artifacts::new(&project, &state.id);
+        assert_eq!(state.phase, Phase::Failed);
+        assert!(
+            state
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("EXECUTION.md"),
+            "unexpected error: {:?}",
+            state.error
+        );
+        assert!(
+            !artifacts.review().is_file(),
+            "the reviewer must never be spawned against a placeholder account"
+        );
+        assert_eq!(
+            state.iteration, 0,
+            "the re-ask is bookkeeping, not a fix attempt"
         );
 
         let _ = std::fs::remove_dir_all(&root);
