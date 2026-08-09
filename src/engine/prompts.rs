@@ -203,8 +203,7 @@ pub fn reviewer(workdir: &Path, artifacts: &Artifacts, diff: &str, delivery: Del
          - anything in `Must NOT Change` that changed\n\n\
          Judge what the code does, not what the executor says it does.\n\n\
          ## Verdict\n\n\
-         Also write a machine-readable verdict to this exact path:\n\n\
-         `{}`\n\n\
+         {}\
          It must be valid JSON in exactly this shape:\n\n\
          ```json\n\
          {{\n\
@@ -230,8 +229,28 @@ pub fn reviewer(workdir: &Path, artifacts: &Artifacts, diff: &str, delivery: Del
         artifacts.read_or_placeholder(&artifacts.plan()),
         artifacts.read_or_placeholder(&artifacts.execution()),
         artifacts.read_or_placeholder(&artifacts.test_results()),
-        artifacts.verdict().display(),
+        verdict_instruction(delivery, &artifacts.verdict()),
     )
+}
+
+/// How the reviewer is asked for its machine-readable verdict.
+///
+/// A reviewer that cannot touch the filesystem must not be told to write a file — the prompt said
+/// "you have no tools" and then named a path two paragraphs later, and a model handed two
+/// instructions that cancel each other produces exactly the confusion that invites. `gates::read`
+/// already recovers a verdict from the returned text, so asking for it inline loses nothing.
+fn verdict_instruction(delivery: Delivery, path: &Path) -> String {
+    match delivery {
+        Delivery::AgentWrites => format!(
+            "Also write a machine-readable verdict to this exact path:\n\n`{}`\n\n",
+            path.display()
+        ),
+        Delivery::KageWrites => {
+            "End your reply with a machine-readable verdict, as the last thing \
+             you write, in a fenced ```json block.\n\n"
+                .to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +349,28 @@ mod tests {
         // Everything else about the prompt is unchanged.
         assert!(prompt.contains("Acceptance Criteria"));
         assert!(prompt.contains("add caching"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reviewer_with_no_filesystem_is_never_told_to_write_a_file() {
+        // Regression guard: the prompt used to say "you have no tools and no filesystem access"
+        // and then name a path for VERDICT.json two paragraphs later. Two instructions that cancel
+        // each other are the most reliable way to get confused output.
+        let (root, artifacts) = artifacts("verdict-inline");
+
+        let prompt = reviewer(&root, &artifacts, "diff", Delivery::KageWrites);
+
+        assert!(prompt.contains("no tools and no filesystem access"));
+        assert!(prompt.contains("End your reply with a machine-readable verdict"));
+        assert!(
+            !prompt.contains("VERDICT.json"),
+            "a model with no filesystem must not be handed a path:\n{prompt}"
+        );
+        // The contract itself is unchanged — only who puts it on disk.
+        assert!(prompt.contains("\"verdict\": \"PASS\""));
+        assert!(prompt.contains("BLOCKED"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

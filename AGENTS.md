@@ -181,15 +181,25 @@ it to compress output. Optional; commands with shell operators always run direct
 
 Honest list of what does not work yet. Do not assume the code is complete because it is tested.
 
-- **A completed run does not commit the agent's work.** The branch stays empty, the `git merge`
-  instruction Kage prints is a no-op, and `kage clean` force-removes the worktree — destroying work
-  it just told the user was safe. This is the most damaging open bug.
+Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
+something already fixed — and a fixed entry left here is a lie told with authority.
+
+- **Planning is spent on tasks that do not need it.** A sixteen-minute architect once planned a
+  235-line change whose shape was already obvious from the repository. That inverts the premise:
+  expensive reasoning went to the cheap part. There is no way to skip the planner today.
 - **The executor often skips `EXECUTION.md`.** Only `PLAN.md` is enforced, so the reviewer receives
-  a placeholder instead of what the executor claims it did.
-- **Agent failures dump raw harness output** — session ids, transport errors, prompt echoes — where
-  one line explains the problem.
+  a placeholder instead of what the executor claims it did and where it deviated.
+- **The live log is not readable while it is live.** Every raw line is kept deliberately — it is the
+  forensic record of what the harness emitted — but a claude planning phase writes hundreds of
+  kilobytes of `thinking_tokens` events, so the file cannot serve the human tailing it. One file is
+  being asked to do two incompatible jobs.
+- **`max_iterations` mixes two kinds of failure.** A build that will not compile and a review that
+  found real problems spend the same budget, so three failed builds can exhaust the run before the
+  reviewer has seen the code at all.
 - **Cross-repo tasks do not work.** Agents are sandboxed to the worktree, and the prompts tell them
   to work only inside it. Use `--no-isolate` or copy the material in.
+- **Task sizing has no rule.** A three-part task overran an executor budget that had been generous
+  for everything before it. Splitting is the answer, but nothing says so at the point of use.
 
 ## Definition of done
 

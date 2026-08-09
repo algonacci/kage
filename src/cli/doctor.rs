@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::adapters::{preflight, proc};
-use crate::config::Project;
+use crate::config::{AdapterKind, Config, Project, RoleConfig};
 
 const CHECK: &str = "\u{2713}";
 const CROSS: &str = "\u{2717}";
@@ -45,7 +45,6 @@ pub async fn run(cwd: &Path) -> Result<()> {
     if let Some(config) = &config {
         println!("Roles");
         for status in preflight::inspect(&config.roles) {
-            let mark = if status.found() { CHECK } else { CROSS };
             let model = status
                 .config
                 .model
@@ -53,6 +52,21 @@ pub async fn run(cwd: &Path) -> Result<()> {
                 .map(|model| format!(" · {model}"))
                 .unwrap_or_default();
 
+            // An API-backed role has no program on PATH. What can go wrong instead is a provider
+            // that is not declared or a key that is not exported — the same class of problem this
+            // command exists to catch before a run pays for a planner.
+            if status.config.adapter == AdapterKind::Api {
+                let (mark, detail) = api_role_status(config, status.config);
+                println!("{mark} {}  api{model}", status.role);
+                println!("    {detail}");
+
+                if mark == CROSS {
+                    required_missing.push(format!("{} ({detail})", status.role));
+                }
+                continue;
+            }
+
+            let mark = if status.found() { CHECK } else { CROSS };
             println!("{mark} {}  {}{model}", status.role, status.config.adapter);
             println!(
                 "    `{}`{}",
@@ -93,6 +107,29 @@ pub async fn run(cwd: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether an API-backed role could actually make its call, and what to say about it.
+///
+/// The key is only tested for presence — never printed, never partially printed. A prefix is still
+/// a secret, and a report is a thing people paste into issues.
+fn api_role_status(config: &Config, role: &RoleConfig) -> (&'static str, String) {
+    let Some(name) = &role.provider else {
+        return (CROSS, "no provider named".to_string());
+    };
+
+    let Some(provider) = config.providers.get(name) else {
+        return (CROSS, format!("provider `{name}` is not declared"));
+    };
+
+    match std::env::var(&provider.api_key_env) {
+        Ok(value) if !value.trim().is_empty() => (
+            CHECK,
+            format!("{} · ${} is set", provider.base_url, provider.api_key_env),
+        ),
+        Ok(_) => (CROSS, format!("${} is set but empty", provider.api_key_env)),
+        Err(_) => (CROSS, format!("${} is not set", provider.api_key_env)),
+    }
 }
 
 fn report_tool(program: &str, install_hint: &str) -> bool {
