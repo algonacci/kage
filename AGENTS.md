@@ -191,8 +191,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **The executor often skips `EXECUTION.md`.** Only `PLAN.md` is enforced, so the reviewer receives
-  a placeholder instead of what the executor claims it did and where it deviated.
 - **The live log is not readable while it is live.** Every raw line is kept deliberately — it is the
   forensic record of what the harness emitted — but a claude planning phase writes hundreds of
   kilobytes of `thinking_tokens` events, so the file cannot serve the human tailing it. One file is
@@ -204,6 +202,24 @@ something already fixed — and a fixed entry left here is a lie told with autho
   to work only inside it. Use `--no-isolate` or copy the material in.
 - **Task sizing has no rule.** A three-part task overran an executor budget that had been generous
   for everything before it. Splitting is the answer, but nothing says so at the point of use.
+- **A timed-out phase still costs its full budget.** The deadline is enforced now, but nothing
+  notices a phase that will obviously not finish, so an hour is spent before anything says so.
+
+## Where the work stands
+
+Kage has built five of its own features. The loop is reliable enough that the interesting failures
+are no longer in the machinery — they are in how a run is scoped and budgeted.
+
+Two lessons worth carrying into whatever comes next, both learned the expensive way:
+
+**A fix that bounds one call and not its neighbours looks complete and is not.** The drains were
+bounded after a timeout; the kill and the reap beside them were not, and a one-hour budget became
+three hours and twenty-two minutes. When bounding anything, bound everything downstream of the same
+decision.
+
+**A constant cost nobody questions is where a bug hides best.** Every `cargo test` took 59 seconds
+for a day, blamed on cargo, because a killed child's grandchild held the stdout pipe. It runs in two
+seconds now. A number that never moves deserves the same suspicion as one that spikes.
 
 ## Definition of done
 
