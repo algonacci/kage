@@ -96,6 +96,16 @@ predicate (`Artifacts::has_content`) so a blank file cannot pass one and trip th
 **A review with no machine-readable verdict blocks the run.** Guessing PASS lets unreviewed code
 through; guessing FAIL burns an iteration on nothing.
 
+**Task sizing is the planner's call, declared before the executor spends anything.** A three-part
+task once overran an executor budget that had been generous for everything before it, and the user
+learned only after the hour was gone. A string heuristic cannot judge task size, but the planner —
+the most capable model in the loop, having just read the repository — can: it is told a plan is
+for one executor run, to plan only the first coherent piece of an oversized task, and to declare
+the rest in a `# Deferred Tasks` section, each piece a one-line task for a later `kage run`. Kage
+relays that section to the terminal the moment the plan lands and never judges it; presence of the
+section *is* the signal, so the planner omits it when the task fits. `--skip-plan` runs are
+exempt: the person typing the task already claimed its shape.
+
 **A silent phase is aborted early as presumed hung.** Every harness Kage spawns prints as it
 works, so total silence for `stall_secs` (default 600; `0` disables) is the one mechanical "this
 will not finish" signal available — a harness stuck on a hidden prompt or a dead connection looks
@@ -224,8 +234,6 @@ something already fixed — and a fixed entry left here is a lie told with autho
 
 - **Cross-repo tasks do not work.** Agents are sandboxed to the worktree, and the prompts tell them
   to work only inside it. Use `--no-isolate` or copy the material in.
-- **Task sizing has no rule.** A three-part task overran an executor budget that had been generous
-  for everything before it. Splitting is the answer, but nothing says so at the point of use.
 - **A phase that keeps talking while going nowhere still costs its full budget.** Silence is now
   acted on (see the stall decision above), but a harness looping noisily is mechanically
   indistinguishable from one working — telling them apart needs judgment about the output, not a

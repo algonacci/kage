@@ -315,6 +315,22 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                     );
                 }
 
+                // An oversized task is surfaced the moment the plan lands, not an hour later when
+                // the executor overruns. The judgment is the planner's; Kage only relays it.
+                if let Some(deferred) =
+                    deferred_tasks(&artifacts.read_or_placeholder(&artifacts.plan()))
+                {
+                    println!(
+                        "  the planner sized this task as more than one run and deferred the rest:"
+                    );
+                    for line in deferred.lines().filter(|line| !line.trim().is_empty()) {
+                        println!("    {line}");
+                    }
+                    println!(
+                        "  when this run completes, start each deferred piece with `kage run`"
+                    );
+                }
+
                 state.transition(Phase::Executing, "plan written");
             }
 
@@ -676,6 +692,43 @@ async fn ensure_account(
     }
 }
 
+/// The plan's `# Deferred Tasks` section, when the planner split an oversized task.
+///
+/// The planner is told to omit the section when the task fits one run, so presence *is* the
+/// signal — this never judges the plan's content, it only extracts what the planner declared.
+/// The header match tolerates `##` and case drift because models produce both, but the section
+/// ends at the next heading of any depth: relaying too much would bury the message this exists
+/// to surface.
+fn deferred_tasks(plan: &str) -> Option<String> {
+    let is_deferred_heading = |line: &str| {
+        let trimmed = line.trim();
+        trimmed.starts_with('#')
+            && trimmed
+                .trim_start_matches('#')
+                .trim()
+                .eq_ignore_ascii_case("deferred tasks")
+    };
+
+    let mut collected = Vec::new();
+    let mut in_section = false;
+    for line in plan.lines() {
+        if in_section {
+            if line.trim_start().starts_with('#') {
+                break;
+            }
+            collected.push(line);
+        } else if is_deferred_heading(line) {
+            in_section = true;
+        }
+    }
+
+    if !in_section {
+        return None;
+    }
+    let body = collected.join("\n").trim().to_string();
+    (!body.is_empty()).then_some(body)
+}
+
 /// The stand-in verdict for a fix that validation, not a reviewer, asked for.
 ///
 /// Test failures reach the FIX phase with no verdict of their own, and a fix cycle's later build
@@ -996,6 +1049,45 @@ mod tests {
 
         assert!(reason.contains("timed out"));
         assert!(reason.contains("timeout_secs"));
+    }
+
+    #[test]
+    fn a_plan_that_defers_work_has_the_deferred_pieces_extracted() {
+        let plan = "# Objective\nShip A.\n\n# Deferred Tasks\n\n- add B\n- add C\n\n# Definition of Done\nA works.";
+
+        let deferred = deferred_tasks(plan).unwrap();
+
+        assert!(deferred.contains("- add B"));
+        assert!(deferred.contains("- add C"));
+        assert!(
+            !deferred.contains("Definition of Done"),
+            "the section ends at the next heading:\n{deferred}"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_a_deferred_section_defers_nothing() {
+        // The planner is told to omit the section when the task fits one run, so absence means
+        // "fits" and must never be reported as a split.
+        assert_eq!(deferred_tasks("# Objective\nShip it all."), None);
+        assert_eq!(
+            deferred_tasks("# Objective\n# Deferred Tasks\n\n   \n# Next"),
+            None,
+            "an empty section carries no message worth relaying"
+        );
+    }
+
+    #[test]
+    fn the_deferred_heading_tolerates_depth_and_case_drift() {
+        // Models drift between `#` and `##` and between title and sentence case; the message must
+        // survive all of them, because losing it re-opens the gap this closes.
+        for heading in ["## Deferred Tasks", "# deferred tasks", "## DEFERRED TASKS"] {
+            let plan = format!("# Objective\nx\n\n{heading}\n- the rest\n");
+            assert!(
+                deferred_tasks(&plan).is_some_and(|d| d.contains("the rest")),
+                "heading `{heading}` was not recognised"
+            );
+        }
     }
 
     #[test]

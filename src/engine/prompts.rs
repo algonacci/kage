@@ -109,7 +109,14 @@ pub fn planner(task: &str, workdir: &Path, artifacts: &Artifacts, delivery: Deli
          ```\n\n\
          Every file you list must really exist or be one you are asking to create — verify paths \
          against the repository rather than guessing them. Acceptance criteria must be checkable \
-         by someone who cannot read your mind.\n",
+         by someone who cannot read your mind.\n\n\
+         A plan is for one executor run. If the task asks for more than one run's worth of work — \
+         several independent deliverables, or more implementation than one focused session — plan \
+         only the first coherent piece, and end the plan with a section titled `# Deferred Tasks` \
+         listing each remaining piece as its own one-line task for a later run. Omit that section \
+         entirely when the task fits: its presence is how the user learns the task was split. \
+         Deferred work is out of scope for this plan's acceptance criteria. An oversized task \
+         discovered mid-run costs the whole budget; a split declared here costs a sentence.\n",
         preamble("planner", workdir),
         deliverable(delivery, &artifacts.plan(), "the plan"),
     )
@@ -484,6 +491,25 @@ mod tests {
         assert!(prompt.contains("PLAN.md"));
         assert!(prompt.contains("Do not implement"));
         assert!(prompt.contains("Acceptance Criteria"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_planner_is_told_to_split_an_oversized_task_and_how_to_declare_it() {
+        // The gap this closes: a three-part task overran an executor budget and the user learned
+        // only after the hour was spent. The split has to be declared at planning time, by the
+        // model qualified to judge size, in a section Kage can relay mechanically.
+        let (root, artifacts) = artifacts("sizing");
+
+        let prompt = planner("do a and b and c", &root, &artifacts, Delivery::AgentWrites);
+
+        assert!(prompt.contains("A plan is for one executor run"));
+        assert!(prompt.contains("# Deferred Tasks"));
+        assert!(
+            prompt.contains("Omit that section entirely when the task fits"),
+            "presence of the section must mean a split, so omission has to be instructed:\n{prompt}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

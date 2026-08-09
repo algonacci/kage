@@ -58,6 +58,16 @@ Before the first phase, `kage run` and `kage resume` resolve the program behind 
 will actually spawn and abort with the same report `kage doctor` gives if one is unreachable — so a
 run cannot spend a planner and an executor before discovering the reviewer was never installed.
 
+### Task sizing
+
+One run, one task. Give the executor about an hour's worth of work and split anything larger —
+a three-part task once overran a budget that had been generous for everything before it.
+
+The planner enforces this at the point where it is cheapest: an oversized task gets a plan for its
+first coherent piece plus a `# Deferred Tasks` section naming each remaining piece as its own
+`kage run` task. Kage prints that section the moment the plan is written, so you learn about the
+split before the executor spends anything, not after the budget is gone.
+
 ### Skipping the plan
 
 Some tasks do not need an architect — the change is small, or its shape is already decided. For
