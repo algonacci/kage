@@ -185,7 +185,9 @@ Each agent's output is streamed to the terminal as it arrives — claude's event
 short progress lines rather than JSON — and its log under `logs/` is written line by line, so
 `tail -f` (or `Get-Content -Wait`) shows what the agent is doing while the phase is still running.
 If an agent goes silent for 30 seconds, Kage prints an elapsed-time line so a long think is not
-mistaken for a hang.
+mistaken for a hang. If it stays completely silent for `stall_secs` (default 600, per role, `0`
+disables), the phase is aborted early as presumed hung instead of billing its whole timeout — a
+harness stuck waiting on a hidden prompt looks exactly like that.
 
 A streaming harness keeps two files there: `<phase>.log` is the raw transcript of every event it
 emitted, and `<phase>.progress.log` — the path Kage prints — is the terminal's rendered view, so

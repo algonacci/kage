@@ -735,6 +735,16 @@ fn agent_failure(result: &crate::adapters::AgentResult, role: &str) -> Option<St
         ));
     }
 
+    if result.stalled {
+        return Some(format!(
+            "the {role} produced no output for its whole stall allowance and was presumed hung \
+             after {}s — a harness waiting on a hidden prompt or a dead connection looks exactly \
+             like this; if this one legitimately works in silence, raise `stall_secs` for that \
+             role, or set it to 0 to never presume",
+            result.duration_secs
+        ));
+    }
+
     let detail = if result.stderr.trim().is_empty() {
         result.stdout.trim()
     } else {
@@ -978,6 +988,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             timed_out: true,
+            stalled: false,
             duration_secs: 1800,
         };
 
@@ -988,12 +999,34 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_agent_is_explained_with_both_remedies() {
+        let result = crate::adapters::AgentResult {
+            code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: false,
+            stalled: true,
+            duration_secs: 610,
+        };
+
+        let reason = agent_failure(&result, "executor").unwrap();
+
+        assert!(reason.contains("presumed hung"), "{reason}");
+        assert!(reason.contains("stall_secs"), "{reason}");
+        assert!(
+            reason.contains("set it to 0"),
+            "the message must name the way out for a legitimately silent harness:\n{reason}"
+        );
+    }
+
+    #[test]
     fn a_failing_agent_surfaces_its_own_error_output() {
         let result = crate::adapters::AgentResult {
             code: Some(1),
             stdout: String::new(),
             stderr: "Error: not authenticated. Run `codex login`.".to_string(),
             timed_out: false,
+            stalled: false,
             duration_secs: 2,
         };
 
@@ -1010,6 +1043,7 @@ mod tests {
             stdout: String::new(),
             stderr: "Traceback:\n  line one\n  line two\nFinalError: boom".to_string(),
             timed_out: false,
+            stalled: false,
             duration_secs: 1,
         };
 
@@ -1027,6 +1061,7 @@ mod tests {
             stdout: "done".to_string(),
             stderr: String::new(),
             timed_out: false,
+            stalled: false,
             duration_secs: 5,
         };
 

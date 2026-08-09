@@ -96,6 +96,14 @@ predicate (`Artifacts::has_content`) so a blank file cannot pass one and trip th
 **A review with no machine-readable verdict blocks the run.** Guessing PASS lets unreviewed code
 through; guessing FAIL burns an iteration on nothing.
 
+**A silent phase is aborted early as presumed hung.** Every harness Kage spawns prints as it
+works, so total silence for `stall_secs` (default 600; `0` disables) is the one mechanical "this
+will not finish" signal available — a harness stuck on a hidden prompt or a dead connection looks
+exactly like this, and it used to bill its entire timeout before anything said so. A stall takes
+the same bounded kill/reap/drain path as a timeout but is reported apart, because the remedies
+differ: a timeout wants a bigger budget, a stall wants to know why the harness went quiet.
+Validation commands and git are exempt — a compiler is legitimately silent for minutes.
+
 **The raw transcript is never filtered; a streaming phase gets a rendered twin instead.**
 `<label>.log` keeps every raw line — it once held the only surviving copy of a plan — but a claude
 planning phase buries it under hundreds of kilobytes of machine events, so the file a human is
@@ -218,8 +226,10 @@ something already fixed — and a fixed entry left here is a lie told with autho
   to work only inside it. Use `--no-isolate` or copy the material in.
 - **Task sizing has no rule.** A three-part task overran an executor budget that had been generous
   for everything before it. Splitting is the answer, but nothing says so at the point of use.
-- **A timed-out phase still costs its full budget.** The deadline is enforced now, but nothing
-  notices a phase that will obviously not finish, so an hour is spent before anything says so.
+- **A phase that keeps talking while going nowhere still costs its full budget.** Silence is now
+  acted on (see the stall decision above), but a harness looping noisily is mechanically
+  indistinguishable from one working — telling them apart needs judgment about the output, not a
+  clock on it.
 
 ## Where the work stands
 

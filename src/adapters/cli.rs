@@ -31,6 +31,8 @@ pub struct CliAdapter {
     template: Vec<String>,
     delivery: PromptDelivery,
     timeout: Duration,
+    /// `None` when the config's `stall_secs` is 0: silence is then never presumed on.
+    stall: Option<Duration>,
     env: Vec<(String, String)>,
     /// How to interpret this argv's stdout, decided from the command line that will actually run.
     stdout_format: stream::OutputFormat,
@@ -62,6 +64,7 @@ impl CliAdapter {
             template,
             delivery: config.prompt_delivery,
             timeout: Duration::from_secs(config.timeout_secs),
+            stall: (config.stall_secs > 0).then(|| Duration::from_secs(config.stall_secs)),
             env: config
                 .env
                 .iter()
@@ -176,6 +179,7 @@ impl AgentAdapter for CliAdapter {
             // A thinking planner can sit silent for minutes; the heartbeat is what tells a working
             // run from a frozen one.
             heartbeat: Some(proc::HEARTBEAT_INTERVAL),
+            stall: self.stall,
             log_path: Some(request.log_path),
             progress_path,
         })
@@ -186,6 +190,7 @@ impl AgentAdapter for CliAdapter {
             stdout: outcome.stdout,
             stderr: outcome.stderr,
             timed_out: outcome.timed_out,
+            stalled: outcome.stalled,
             duration_secs: outcome.duration.as_secs(),
         })
     }
@@ -349,6 +354,23 @@ mod tests {
         let argv = rendered(&config, "x");
 
         assert_eq!(argv, vec!["my-agent", "--task", "/tmp/p.md", "--yolo"]);
+    }
+
+    #[test]
+    fn a_stall_of_zero_means_silence_is_never_presumed_on() {
+        let mut config = RoleConfig::preset(AdapterKind::OpenCode);
+        assert_eq!(
+            adapter(&config).stall,
+            Some(std::time::Duration::from_secs(600)),
+            "the default allowance applies unless turned off"
+        );
+
+        config.stall_secs = 0;
+        assert_eq!(
+            adapter(&config).stall,
+            None,
+            "0 must disable the check, not create a zero-length allowance that kills every spawn"
+        );
     }
 
     #[test]

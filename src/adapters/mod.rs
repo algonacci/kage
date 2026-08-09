@@ -62,12 +62,15 @@ pub struct AgentResult {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    /// The backend said nothing for its whole stall allowance and was aborted as presumed hung —
+    /// distinct from `timed_out` because the remedies differ.
+    pub stalled: bool,
     pub duration_secs: u64,
 }
 
 impl AgentResult {
     pub fn success(&self) -> bool {
-        self.code == Some(0) && !self.timed_out
+        self.code == Some(0) && !self.timed_out && !self.stalled
     }
 }
 

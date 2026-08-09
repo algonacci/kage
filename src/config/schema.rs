@@ -105,6 +105,15 @@ pub struct RoleConfig {
     pub prompt_delivery: PromptDelivery,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// How long the harness may produce no output at all before it is presumed hung and the
+    /// phase is aborted early. `0` disables the check.
+    ///
+    /// Total silence is the one mechanical "this will not finish" signal available: every harness
+    /// Kage spawns prints as it works, so a process that says nothing for this long is stuck on a
+    /// hidden prompt or a dead connection — and without this check it bills its entire timeout
+    /// before anything says so.
+    #[serde(default = "default_stall_secs")]
+    pub stall_secs: u64,
     /// Appended verbatim after the generated arguments. This is the escape hatch for harness flags
     /// Kage does not model.
     ///
@@ -122,6 +131,12 @@ fn default_timeout_secs() -> u64 {
     1800
 }
 
+/// Generous against the longest silence a working harness has shown, small against the budget the
+/// check exists to protect.
+fn default_stall_secs() -> u64 {
+    600
+}
+
 impl RoleConfig {
     /// A role wired to a known harness with that harness's conventional flags.
     pub fn preset(adapter: AdapterKind) -> Self {
@@ -132,6 +147,7 @@ impl RoleConfig {
             provider: None,
             prompt_delivery: PromptDelivery::default(),
             timeout_secs: default_timeout_secs(),
+            stall_secs: default_stall_secs(),
             extra_args: None,
             env: BTreeMap::new(),
         }

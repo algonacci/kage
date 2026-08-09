@@ -31,6 +31,8 @@ pub async fn git(workdir: &Path, args: &[&str]) -> Result<String> {
         stream_prefix: None,
         stdout_format: crate::adapters::stream::OutputFormat::Passthrough,
         heartbeat: None,
+        // Git is local and fast; the short timeout above already catches a hang.
+        stall: None,
         log_path: None,
         progress_path: None,
     })

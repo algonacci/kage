@@ -176,6 +176,7 @@ impl AgentAdapter for ApiAdapter {
                 stdout: String::new(),
                 stderr: format!("provider returned HTTP {status}: {detail}"),
                 timed_out: false,
+                stalled: false,
                 duration_secs,
             });
         }
@@ -207,6 +208,7 @@ impl AgentAdapter for ApiAdapter {
                     stdout: content,
                     stderr: String::new(),
                     timed_out: false,
+                    stalled: false,
                     duration_secs,
                 })
             }
@@ -215,6 +217,7 @@ impl AgentAdapter for ApiAdapter {
                 stdout: String::new(),
                 stderr: redact(&format!("{error:#}"), &self.api_key),
                 timed_out: false,
+                stalled: false,
                 duration_secs,
             }),
         }

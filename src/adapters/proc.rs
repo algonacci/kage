@@ -28,18 +28,29 @@ pub struct Outcome {
     /// Always raw: harness errors are plain text and are never JSON-decoded.
     pub stderr: String,
     pub timed_out: bool,
+    /// The child said nothing for its whole stall allowance and was presumed hung.
+    ///
+    /// Kept apart from `timed_out` because the remedies differ: a timeout wants a bigger budget,
+    /// a stall wants to know why the harness went quiet.
+    pub stalled: bool,
     pub duration: Duration,
 }
 
 impl Outcome {
     pub fn success(&self) -> bool {
-        self.code == Some(0) && !self.timed_out
+        self.code == Some(0) && !self.timed_out && !self.stalled
     }
 
     /// A short human explanation of how the process ended.
     pub fn describe(&self) -> String {
         if self.timed_out {
             return format!("timed out after {}s", self.duration.as_secs());
+        }
+        if self.stalled {
+            return format!(
+                "presumed hung after {}s — no output for the whole stall allowance",
+                self.duration.as_secs()
+            );
         }
         match self.code {
             Some(0) => format!("ok in {}s", self.duration.as_secs()),
@@ -79,6 +90,14 @@ pub struct Spawn {
     pub stdout_format: stream::OutputFormat,
     /// How often to print an elapsed-time line while the child is silent. `None` prints none.
     pub heartbeat: Option<Duration>,
+    /// Total silence longer than this aborts the child as presumed hung. `None` never presumes.
+    ///
+    /// Every harness Kage spawns prints as it works, so a child that says nothing for this long
+    /// is stuck — on a hidden prompt, a dead connection, an interactive fallback — and without
+    /// this it bills its entire timeout before anything says so. Silence is the only mechanical
+    /// "this will not finish" signal available; a child that keeps talking is left alone however
+    /// long it takes.
+    pub stall: Option<Duration>,
     /// Combined stdout+stderr transcript, written even if the process is killed.
     pub log_path: Option<PathBuf>,
     /// A second, human-readable view of the same run: the terminal's rendered lines, on disk.
@@ -244,17 +263,46 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         })
     });
 
+    // Wait for exit, the deadline, or a stall — whichever comes first. The stall deadline moves
+    // every time output arrives, so the loop re-arms on each wake instead of arming once: waking
+    // to find the child talked is the normal case, not an error.
     let mut timed_out = false;
-    let status = match tokio::time::timeout(spawn.timeout, child.wait()).await {
-        Ok(status) => Some(status.context("cannot wait for child process")?),
-        Err(_) => {
+    let mut stalled = false;
+    let deadline = started + spawn.timeout;
+    let exit_status = loop {
+        let now = Instant::now();
+        if now >= deadline {
             timed_out = true;
+            break None;
+        }
 
+        let mut wake = deadline;
+        if let Some(stall) = spawn.stall {
+            let silent_until = stall_deadline(started, last_output.load(Ordering::Relaxed), stall);
+            if now >= silent_until {
+                stalled = true;
+                break None;
+            }
+            wake = wake.min(silent_until);
+        }
+
+        match tokio::time::timeout_at(wake.into(), child.wait()).await {
+            Ok(status) => break Some(status.context("cannot wait for child process")?),
+            // Woke without an exit: the deadline may have passed, the silence may have run out,
+            // or the child may have spoken and moved its stall deadline. The next pass decides.
+            Err(_) => continue,
+        }
+    };
+
+    let status = match exit_status {
+        Some(status) => Some(status),
+        None => {
             // Everything past this point is bounded, because none of it is worth waiting on. A
-            // timeout is a decision already made: the child has spent its budget and its output
-            // will be discarded either way. Leaving the kill and the reap unbounded turned a
-            // one-hour budget into a three-hour-twenty-two-minute run — the deadline fired on
-            // time and then Kage waited for a process that had already been told to die.
+            // timeout or a stall is a decision already made: the child has spent its budget (or
+            // proven it is not using it) and its output will be discarded either way. Leaving the
+            // kill and the reap unbounded turned a one-hour budget into a
+            // three-hour-twenty-two-minute run — the deadline fired on time and then Kage waited
+            // for a process that had already been told to die.
             //
             // Killing the tree rather than the child is separate and still necessary: coding-agent
             // CLIs spawn helpers that inherit the stdout pipe, and while those live the drains
@@ -262,9 +310,10 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
             let _ = tokio::time::timeout(KILL_GRACE, kill_tree(&mut child)).await;
 
             match tokio::time::timeout(REAP_GRACE, child.wait()).await {
-                Ok(status) => Some(status.context("cannot reap timed-out child")?),
-                // Unreapable. The exit status is unknown and stays that way; `timed_out` is what
-                // the caller acts on, and pretending to a code would be worse than admitting none.
+                Ok(status) => Some(status.context("cannot reap aborted child")?),
+                // Unreapable. The exit status is unknown and stays that way; `timed_out` and
+                // `stalled` are what the caller acts on, and pretending to a code would be worse
+                // than admitting none.
                 Err(_) => None,
             }
         }
@@ -279,8 +328,8 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
     // After a kill, a straggler that survived the tree-kill can still hold the pipe open; give
     // the drains a short grace and then abandon them rather than pinning the run indefinitely.
     // The live log has already recorded every line as it arrived, so nothing durable is lost —
-    // only the in-memory capture is cut short, on a run whose outcome is already "timed out".
-    let (stdout, stderr) = if timed_out {
+    // only the in-memory capture is cut short, on a run whose outcome is already decided.
+    let (stdout, stderr) = if timed_out || stalled {
         let stdout = tokio::time::timeout(DRAIN_GRACE, stdout_task)
             .await
             .ok()
@@ -299,15 +348,17 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         )
     };
 
+    let outcome = Outcome {
+        code: status.and_then(|status| status.code()),
+        stdout,
+        stderr,
+        timed_out,
+        stalled,
+        duration: started.elapsed(),
+    };
+
     if log.is_some() || progress.is_some() {
-        let finished = Outcome {
-            code: status.and_then(|status| status.code()),
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            timed_out,
-            duration: started.elapsed(),
-        }
-        .describe();
+        let finished = outcome.describe();
         if let Some(log) = &log {
             lock_log(log, |writer| writer.finish(&finished));
         }
@@ -316,13 +367,16 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         }
     }
 
-    Ok(Outcome {
-        code: status.and_then(|status| status.code()),
-        stdout,
-        stderr,
-        timed_out,
-        duration: started.elapsed(),
-    })
+    Ok(outcome)
+}
+
+/// The moment a child's silence runs out: its last output plus the whole stall allowance.
+///
+/// Pure so the arithmetic that decides an early abort is testable without spawning anything —
+/// this is the line that turns "Kage knew" into "Kage acted", and it must not be wrong in either
+/// direction.
+fn stall_deadline(started: Instant, last_output_ms: u64, stall: Duration) -> Instant {
+    started + Duration::from_millis(last_output_ms) + stall
 }
 
 /// The lock on the shared transcript, released on every body exit.
@@ -705,6 +759,9 @@ pub fn shell_spawn(command: &str, workdir: PathBuf, timeout: Duration) -> Spawn 
         stream_prefix: None,
         stdout_format: stream::OutputFormat::Passthrough,
         heartbeat: None,
+        // Validation commands may be legitimately silent for minutes — a compiler or a long test
+        // says nothing until it is done — so silence proves nothing here and is never presumed on.
+        stall: None,
         log_path: None,
         progress_path: None,
     }
@@ -726,6 +783,7 @@ mod tests {
             stream_prefix: None,
             stdout_format: stream::OutputFormat::Passthrough,
             heartbeat: None,
+            stall: None,
             log_path: None,
             progress_path: None,
         }
@@ -1153,6 +1211,55 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_silent_child_is_presumed_hung_at_the_stall_allowance() {
+        // The gap this closes: a harness stuck on a hidden prompt bills its entire timeout before
+        // anything says so — the heartbeat knew and did nothing, because knowing was in one place
+        // and acting in another. Total silence past the allowance now aborts the child early.
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1"
+        } else {
+            "sleep 60"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.stall = Some(Duration::from_millis(600));
+
+        let started = std::time::Instant::now();
+        let outcome = run(spawn).await.unwrap();
+
+        assert!(outcome.stalled, "{outcome:?}");
+        assert!(!outcome.timed_out, "a stall is not a timeout: {outcome:?}");
+        assert!(!outcome.success());
+        assert!(
+            outcome.describe().contains("hung"),
+            "{}",
+            outcome.describe()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the stall must fire long before the timeout, not beside it"
+        );
+    }
+
+    #[test]
+    fn output_pushes_the_stall_deadline_forward() {
+        // The arithmetic that decides an early abort, tested without a process: a child that spoke
+        // recently is left alone, and one that has been silent for the whole allowance is not.
+        let started = Instant::now();
+        let stall = Duration::from_secs(600);
+
+        let fresh = stall_deadline(started, 0, stall);
+        assert_eq!(fresh, started + stall, "silence counts from the spawn");
+
+        let spoke_at_10m = stall_deadline(started, 600_000, stall);
+        assert_eq!(
+            spoke_at_10m,
+            started + Duration::from_secs(1200),
+            "every line buys the child a fresh allowance"
+        );
+        assert!(spoke_at_10m > fresh);
     }
 
     #[test]
