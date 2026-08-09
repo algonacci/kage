@@ -86,8 +86,8 @@ validation:
     - cargo clippy --all-targets -- -D warnings
 ```
 
-Adapters: `claude-code`, `codex`, `opencode`, `kamui`, and `command`. The last one runs any binary
-that takes a prompt:
+Adapters: `claude-code`, `codex`, `opencode`, `kamui`, `command`, and `api`. The `command` adapter
+runs any binary that takes a prompt:
 
 ```yaml
 executor:
@@ -100,6 +100,35 @@ executor:
 `{prompt}` is replaced with the instruction and `{prompt_file}` with the path to it. By default the
 prompt is written to a file and the agent is given a one-line pointer, which keeps the command line
 small no matter how large the plan grows. Set `prompt_delivery: arg` or `stdin` to change that.
+
+### API-backed roles
+
+The planner and the reviewer can be filled by an HTTP endpoint instead of a local harness, so a
+model paid for by the token can be mixed with a subscription CLI in one workflow:
+
+```yaml
+providers:
+  orvix:
+    base_url: https://api.orvix.id/v1
+    api_key_env: ORVIX_API_KEY
+
+roles:
+  planner:
+    adapter: api
+    provider: orvix
+    model: anthropic/claude-opus-5
+
+  executor:
+    adapter: opencode
+```
+
+The key is read from the named environment variable, never from the config file. Kage assembles
+these roles' context from artifacts and writes their deliverable from the reply, so they need no
+tools of their own.
+
+The executor cannot be backed this way, and the config is rejected if it is. It has to read, edit,
+compile, and re-run tests; supporting that over a completions endpoint would mean Kage growing its
+own tool loop — which is the one thing it exists not to do.
 
 Leave `model` unset to use whatever the harness is already configured with, which is usually what
 you want with a subscription CLI. A name the harness does not recognise fails the whole run, so only

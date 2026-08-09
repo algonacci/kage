@@ -17,6 +17,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"
 thiserror = "2.0.20"
+# rustls rather than the platform TLS stack: CI builds on Linux, macOS and Windows, and native-tls
+# would make the Linux job depend on OpenSSL development headers being present.
+reqwest = { version = "0.13.2", default-features = false, features = [
+    "charset",
+    "http2",
+    "json",
+    "rustls",
+] }
 tokio = { version = "1.53.1", features = [
     "fs",
     "io-util",

@@ -41,6 +41,7 @@ src/
 ├── adapters/
 │   ├── mod.rs           AgentAdapter trait, Role, the role -> backend seam
 │   ├── cli.rs           spawning coding-agent CLIs; per-harness argv presets
+│   ├── api.rs           an HTTP endpoint filling a role, for planner and reviewer only
 │   ├── preflight.rs     resolve every role's program before a run spends anything
 │   ├── proc.rs          all process spawning: capture, timeout, PATH, rtk routing, live logs, heartbeat
 │   └── stream.rs        rendering a streaming harness's events as progress lines
@@ -91,7 +92,15 @@ agent was told, which is the first thing you want when a run goes wrong.
 uncommitted work. Branches outlive their checkouts, so `kage clean` keeps them.
 
 **Kage owns no harness credentials.** Authentication is each tool's business. A harness that is not
-logged in is a `kage doctor` finding, not something Kage fixes.
+logged in is a `kage doctor` finding, not something Kage fixes. An API provider is the exception
+only in that its key is read from an environment variable named in the config — never from the
+config itself, which gets committed, pasted into issues, and read by the agents Kage spawns.
+
+**Only the planner and the reviewer may be backed by an API.** Both are text-in, text-out: Kage
+assembles their context from artifacts and writes their deliverable from the reply. The executor
+must read, edit, compile and re-run tests, so backing it with a completions endpoint would mean
+growing a tool loop here — rebuilding the agents Kage exists to orchestrate. `Config::validate`
+rejects that configuration outright rather than half-supporting it.
 
 ## Harness facts
 
@@ -179,8 +188,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
   a placeholder instead of what the executor claims it did.
 - **Agent failures dump raw harness output** — session ids, transport errors, prompt echoes — where
   one line explains the problem.
-- **API adapters do not exist.** The `AgentAdapter` trait and the seam are in place; only
-  `CliAdapter` is implemented.
 - **Cross-repo tasks do not work.** Agents are sandboxed to the worktree, and the prompts tell them
   to work only inside it. Use `--no-isolate` or copy the material in.
 

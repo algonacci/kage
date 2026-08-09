@@ -35,7 +35,7 @@ pub async fn start(
 ) -> Result<RunState> {
     // Before anything is allocated on disk: a run that cannot reach one of its harnesses must cost
     // nothing, and must not leave a half-run behind for the user to clean up.
-    preflight::check(&config.roles)?;
+    preflight::check(config)?;
 
     let run_id = project.next_run_id(chrono::Local::now())?;
     let max_iterations = options
@@ -98,7 +98,7 @@ pub async fn start(
 pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> Result<RunState> {
     // A resume spends no writes on a run that cannot reach its harnesses: the state file must stay
     // exactly as it was, so the run stays resumable once the harness is installed.
-    preflight::check(&config.roles)?;
+    preflight::check(config)?;
 
     // A worktree can be removed between runs; recreate it so a resumed run still has its checkout.
     if let Some(worktree) = &state.worktree
@@ -225,9 +225,9 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
     let artifacts = Artifacts::for_run(project, &state.id, &state.workdir);
     artifacts.ensure_dirs()?;
 
-    let planner = adapters::build(Role::Planner, &config.roles.planner)?;
-    let executor = adapters::build(Role::Executor, &config.roles.executor)?;
-    let reviewer = adapters::build(Role::Reviewer, &config.roles.reviewer)?;
+    let planner = adapters::build(Role::Planner, config)?;
+    let executor = adapters::build(Role::Executor, config)?;
+    let reviewer = adapters::build(Role::Reviewer, config)?;
 
     while !state.phase.is_terminal() {
         store::save(project, &state)?;
@@ -240,11 +240,15 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
 
             Phase::Planning => {
                 banner(&state, "PLAN", &planner.describe());
-                let prompt = prompts::planner(&state.task, &state.workdir, &artifacts);
+                let delivery = prompts::Delivery::from_adapter(planner.writes_own_artifacts());
+                let prompt = prompts::planner(&state.task, &state.workdir, &artifacts, delivery);
 
                 let result = run_agent(&*planner, &state, &artifacts, "planner", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "planner") {
                     return fail(project, state, reason);
+                }
+                if let Err(error) = save_reply(delivery, &result, &artifacts.plan()) {
+                    return fail(project, state, format!("{error:#}"));
                 }
                 if !artifacts.plan().is_file() {
                     return fail(
@@ -261,7 +265,8 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
 
             Phase::Executing => {
                 banner(&state, "EXECUTE", &executor.describe());
-                let prompt = prompts::executor(&state.workdir, &artifacts);
+                let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
+                let prompt = prompts::executor(&state.workdir, &artifacts, delivery);
 
                 let result = run_agent(&*executor, &state, &artifacts, "executor", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
@@ -312,10 +317,14 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 // A stale verdict from the previous iteration must not be mistaken for this one's.
                 let _ = std::fs::remove_file(artifacts.verdict());
 
-                let prompt = prompts::reviewer(&state.workdir, &artifacts, &diff);
+                let delivery = prompts::Delivery::from_adapter(reviewer.writes_own_artifacts());
+                let prompt = prompts::reviewer(&state.workdir, &artifacts, &diff, delivery);
                 let result = run_agent(&*reviewer, &state, &artifacts, "reviewer", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "reviewer") {
                     return fail(project, state, reason);
+                }
+                if let Err(error) = save_reply(delivery, &result, &artifacts.review()) {
+                    return fail(project, state, format!("{error:#}"));
                 }
 
                 let Some(verdict) = gates::read(&artifacts.verdict(), &result.stdout) else {
@@ -419,6 +428,39 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
     artifacts.sync()?;
     store::save(project, &state)?;
     Ok(state)
+}
+
+/// Put an API-backed role's reply on disk where the next phase expects to find it.
+///
+/// A spawned harness has already written the file itself, so this does nothing for it. For a role
+/// that only returns text, this is the step that makes the two kinds of backend interchangeable to
+/// everything downstream — the phase checks, the next prompt, and `kage status` all keep reading
+/// files and never learn which kind produced them.
+///
+/// The reviewer's `VERDICT.json` is deliberately not written here: `gates::read` already falls back
+/// to finding the verdict in the returned text, which is the same recovery a chatty CLI reviewer
+/// gets.
+fn save_reply(
+    delivery: prompts::Delivery,
+    result: &crate::adapters::AgentResult,
+    path: &std::path::Path,
+) -> Result<()> {
+    if delivery == prompts::Delivery::AgentWrites {
+        return Ok(());
+    }
+
+    if result.stdout.trim().is_empty() {
+        anyhow::bail!(
+            "the model returned nothing to save as {}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    std::fs::write(path, &result.stdout).with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// Spend an iteration on a fix, or report that none remain.

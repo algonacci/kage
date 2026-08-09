@@ -91,7 +91,8 @@ fn preset_template(kind: AdapterKind, model: Option<&str>) -> Vec<String> {
         AdapterKind::OpenCode => vec!["opencode".into(), "run".into()],
         // Verified against Kamui's own argument parser: `kamui -p <prompt> [--auto-approve]`.
         AdapterKind::Kamui => vec!["kamui".into(), "-p".into()],
-        AdapterKind::Command => Vec::new(),
+        // Reached only through a `command:` override; an API role never builds a CliAdapter.
+        AdapterKind::Api | AdapterKind::Command => Vec::new(),
     };
 
     if let Some(model) = model {
@@ -99,7 +100,7 @@ fn preset_template(kind: AdapterKind, model: Option<&str>) -> Vec<String> {
             AdapterKind::ClaudeCode => Some("--model"),
             AdapterKind::Codex | AdapterKind::OpenCode => Some("-m"),
             // Kamui picks its model from its own config; there is no per-invocation flag.
-            AdapterKind::Kamui | AdapterKind::Command => None,
+            AdapterKind::Kamui | AdapterKind::Api | AdapterKind::Command => None,
         };
         if let Some(flag) = flag {
             argv.push(flag.to_string());

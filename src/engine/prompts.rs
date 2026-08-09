@@ -24,15 +24,48 @@ fn preamble(role: &str, workdir: &Path) -> String {
 ///
 /// Stating this explicitly matters: a CLI agent's natural instinct is to print its answer, and a
 /// printed plan is invisible to the next phase, which reads from disk.
-fn deliverable(path: &Path, what: &str) -> String {
-    format!(
-        "## Deliverable\n\n\
-         Write {what} to this exact path:\n\n\
-         `{}`\n\n\
-         Create or overwrite that file. Do not print the content instead of writing it — the next \
-         stage of the loop reads the file, not your terminal output.\n\n",
-        path.display()
-    )
+fn deliverable(delivery: Delivery, path: &Path, what: &str) -> String {
+    match delivery {
+        Delivery::AgentWrites => format!(
+            "## Deliverable\n\n\
+             Write {what} to this exact path:\n\n\
+             `{}`\n\n\
+             Create or overwrite that file. Do not print the content instead of writing it — the \
+             next stage of the loop reads the file, not your terminal output.\n\n",
+            path.display()
+        ),
+        Delivery::KageWrites => format!(
+            "## Deliverable\n\n\
+             Reply with {what} and nothing else. Your entire response is saved verbatim as `{}`, \
+             so anything else you write — a preamble, a closing remark, a fence wrapped around the \
+             whole answer — ends up inside the artifact the next stage reads.\n\n\
+             You have no tools and no filesystem access. Everything you need is in this message.\n\n",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ),
+    }
+}
+
+/// Who puts the deliverable on disk.
+///
+/// A spawned harness writes its own file; an API-backed role returns text and Kage saves it. The
+/// rest of the prompt is identical either way — only this instruction differs, because telling a
+/// model with no filesystem to "write to this path" earns a confident description of a file that
+/// was never created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    AgentWrites,
+    KageWrites,
+}
+
+impl Delivery {
+    /// The adapter's `writes_own_artifacts`, as a delivery mode.
+    pub fn from_adapter(writes_own_artifacts: bool) -> Self {
+        if writes_own_artifacts {
+            Self::AgentWrites
+        } else {
+            Self::KageWrites
+        }
+    }
 }
 
 /// Ask the planner for an executable engineering contract.
@@ -40,7 +73,7 @@ fn deliverable(path: &Path, what: &str) -> String {
 /// The structure below is what turns a plan into something a cheap executor can follow literally.
 /// A vague plan pushes design decisions down to the weakest model in the loop, which is exactly
 /// backwards from the premise that expensive reasoning should happen once, up front.
-pub fn planner(task: &str, workdir: &Path, artifacts: &Artifacts) -> String {
+pub fn planner(task: &str, workdir: &Path, artifacts: &Artifacts, delivery: Delivery) -> String {
     format!(
         "{}\
          Your job is to produce an implementation plan. You are the most capable model in this \
@@ -78,12 +111,12 @@ pub fn planner(task: &str, workdir: &Path, artifacts: &Artifacts) -> String {
          against the repository rather than guessing them. Acceptance criteria must be checkable \
          by someone who cannot read your mind.\n",
         preamble("planner", workdir),
-        deliverable(&artifacts.plan(), "the plan"),
+        deliverable(delivery, &artifacts.plan(), "the plan"),
     )
 }
 
 /// Ask the executor to implement the plan as written.
-pub fn executor(workdir: &Path, artifacts: &Artifacts) -> String {
+pub fn executor(workdir: &Path, artifacts: &Artifacts, delivery: Delivery) -> String {
     format!(
         "{}\
          A plan has already been written by an architect. Implement it.\n\n\
@@ -102,7 +135,11 @@ pub fn executor(workdir: &Path, artifacts: &Artifacts) -> String {
          In your deliverable, record what you changed, which plan steps are done, anything you \
          could not do, and any place you deviated from the plan and why.\n",
         preamble("executor", workdir),
-        deliverable(&artifacts.execution(), "a summary of the work you did"),
+        deliverable(
+            delivery,
+            &artifacts.execution(),
+            "a summary of the work you did"
+        ),
         artifacts.plan().display(),
         artifacts.read_or_placeholder(&artifacts.plan()),
     )
@@ -134,7 +171,11 @@ pub fn fixer(
          - Re-run the tests before you finish.\n\n\
          In your deliverable, record what you changed for each finding, by id.\n",
         preamble("executor", workdir),
-        deliverable(&artifacts.execution(), "a summary of the fixes you made"),
+        deliverable(
+            Delivery::AgentWrites,
+            &artifacts.execution(),
+            "a summary of the fixes you made",
+        ),
         verdict.issues_markdown(),
         artifacts.read_or_placeholder(&artifacts.test_results()),
         artifacts.read_or_placeholder(&artifacts.plan()),
@@ -142,7 +183,7 @@ pub fn fixer(
 }
 
 /// Ask the reviewer to judge the work and emit a machine-readable verdict.
-pub fn reviewer(workdir: &Path, artifacts: &Artifacts, diff: &str) -> String {
+pub fn reviewer(workdir: &Path, artifacts: &Artifacts, diff: &str, delivery: Delivery) -> String {
     format!(
         "{}\
          Review the implementation below against the plan it was supposed to follow. Be skeptical: \
@@ -185,7 +226,7 @@ pub fn reviewer(workdir: &Path, artifacts: &Artifacts, diff: &str) -> String {
          Do not return `PASS` with unresolved issues listed. If the work is not acceptable, say \
          `FAIL` — approving broken work costs far more than another iteration.\n",
         preamble("reviewer", workdir),
-        deliverable(&artifacts.review(), "your full review"),
+        deliverable(delivery, &artifacts.review(), "your full review"),
         artifacts.read_or_placeholder(&artifacts.plan()),
         artifacts.read_or_placeholder(&artifacts.execution()),
         artifacts.read_or_placeholder(&artifacts.test_results()),
@@ -214,7 +255,12 @@ mod tests {
     fn the_planner_is_told_where_to_write_and_not_to_implement() {
         let (root, artifacts) = artifacts("planner");
 
-        let prompt = planner("add rate limiting", &root, &artifacts);
+        let prompt = planner(
+            "add rate limiting",
+            &root,
+            &artifacts,
+            Delivery::AgentWrites,
+        );
 
         assert!(prompt.contains("add rate limiting"));
         assert!(prompt.contains("PLAN.md"));
@@ -229,7 +275,7 @@ mod tests {
         let (root, artifacts) = artifacts("executor");
         std::fs::write(artifacts.plan(), "# Objective\nShip the widget.").unwrap();
 
-        let prompt = executor(&root, &artifacts);
+        let prompt = executor(&root, &artifacts, Delivery::AgentWrites);
 
         assert!(prompt.contains("Ship the widget."));
         assert!(prompt.contains("Implement this plan exactly."));
@@ -241,7 +287,7 @@ mod tests {
     fn a_missing_plan_degrades_to_a_placeholder_rather_than_a_crash() {
         let (root, artifacts) = artifacts("missing");
 
-        let prompt = executor(&root, &artifacts);
+        let prompt = executor(&root, &artifacts, Delivery::AgentWrites);
 
         assert!(prompt.contains("PLAN.md is missing or empty"));
 
@@ -267,11 +313,38 @@ mod tests {
     }
 
     #[test]
+    fn a_model_with_no_filesystem_is_asked_for_a_reply_not_a_file() {
+        // Telling a completions endpoint to "write to this exact path" earns a confident
+        // description of a file that was never created.
+        let (root, artifacts) = artifacts("kage-writes");
+
+        let prompt = planner("add caching", &root, &artifacts, Delivery::KageWrites);
+
+        assert!(prompt.contains("Reply with the plan and nothing else"));
+        assert!(prompt.contains("saved verbatim as `PLAN.md`"));
+        assert!(prompt.contains("no tools and no filesystem access"));
+        assert!(
+            !prompt.contains("Write the plan to this exact path"),
+            "the file instruction must be gone, not merely supplemented"
+        );
+        // Everything else about the prompt is unchanged.
+        assert!(prompt.contains("Acceptance Criteria"));
+        assert!(prompt.contains("add caching"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn the_reviewer_gets_the_diff_and_the_verdict_contract() {
         let (root, artifacts) = artifacts("reviewer");
         std::fs::write(artifacts.plan(), "# Objective\nx").unwrap();
 
-        let prompt = reviewer(&root, &artifacts, "diff --git a/src/a.rs b/src/a.rs");
+        let prompt = reviewer(
+            &root,
+            &artifacts,
+            "diff --git a/src/a.rs b/src/a.rs",
+            Delivery::AgentWrites,
+        );
 
         assert!(prompt.contains("diff --git"));
         assert!(prompt.contains("VERDICT.json"));

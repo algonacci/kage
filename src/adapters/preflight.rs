@@ -49,6 +49,11 @@ pub fn program_for(config: &RoleConfig) -> String {
         AdapterKind::Codex => "codex".to_string(),
         AdapterKind::OpenCode => "opencode".to_string(),
         AdapterKind::Kamui => "kamui".to_string(),
+        // Not a program on PATH at all: the provider name is what identifies this role.
+        AdapterKind::Api => config
+            .provider
+            .clone()
+            .unwrap_or_else(|| UNCONFIGURED.to_string()),
         AdapterKind::Command => UNCONFIGURED.to_string(),
     }
 }
@@ -85,13 +90,19 @@ pub fn not_ready(missing: &[String]) -> String {
 ///
 /// Called before a run touches the disk, so a run that cannot finish leaves no run directory, no
 /// worktree, and no state file behind.
-pub fn check(roles: &Roles) -> Result<()> {
+pub fn check(config: &crate::config::Config) -> Result<()> {
     let mut missing = Vec::new();
 
-    for status in inspect(roles) {
+    for status in inspect(&config.roles) {
         // A role that is misconfigured rather than missing has a better message of its own, and it
         // is worth more than reporting `<unconfigured>` as absent from PATH.
-        crate::adapters::build(status.role, status.config)?;
+        crate::adapters::build(status.role, config)?;
+
+        // An API-backed role has no program to find: its reachability is the endpoint's, and a
+        // missing key already failed in `build` above with a message naming the variable.
+        if status.config.adapter == crate::config::AdapterKind::Api {
+            continue;
+        }
 
         if !status.found() {
             missing.push(status.label());
@@ -118,6 +129,13 @@ mod tests {
         role
     }
 
+    /// A `Config` carrying only these roles, which is all `check` reads for a CLI-backed setup.
+    fn config_with(roles: Roles) -> crate::config::Config {
+        let mut config: crate::config::Config = serde_yaml_ng::from_str("{}").unwrap();
+        config.roles = roles;
+        config
+    }
+
     fn current_exe() -> String {
         std::env::current_exe()
             .unwrap()
@@ -133,7 +151,7 @@ mod tests {
             reviewer: role_step_with_program(&current_exe()),
         };
 
-        assert!(check(&roles).is_ok());
+        assert!(check(&config_with(roles)).is_ok());
     }
 
     #[test]
@@ -144,7 +162,7 @@ mod tests {
             reviewer: role_step_with_program("kage-definitely-not-installed"),
         };
 
-        let error = check(&roles).unwrap_err().to_string();
+        let error = check(&config_with(roles)).unwrap_err().to_string();
 
         assert!(error.contains(
             "Not ready: install or reconfigure reviewer (kage-definitely-not-installed)."
@@ -159,7 +177,7 @@ mod tests {
             reviewer: role_step_with_program("kage-definitely-not-installed"),
         };
 
-        let error = check(&roles).unwrap_err().to_string();
+        let error = check(&config_with(roles)).unwrap_err().to_string();
 
         assert!(error.contains("planner (kage-definitely-not-installed)"));
         assert!(error.contains("reviewer (kage-definitely-not-installed)"));
@@ -181,7 +199,7 @@ mod tests {
             reviewer: RoleConfig::preset(AdapterKind::Command),
         };
 
-        let error = check(&roles).unwrap_err().to_string();
+        let error = check(&config_with(roles)).unwrap_err().to_string();
 
         assert!(error.contains("no `command`"));
         assert!(
@@ -201,8 +219,10 @@ mod tests {
             AdapterKind::OpenCode,
             AdapterKind::Kamui,
         ] {
-            let config = RoleConfig::preset(kind);
-            let program = program_for(&config);
+            let role_config = RoleConfig::preset(kind);
+            let program = program_for(&role_config);
+            let mut config: crate::config::Config = serde_yaml_ng::from_str("{}").unwrap();
+            config.roles.planner = role_config;
             let described = crate::adapters::build(Role::Planner, &config)
                 .unwrap()
                 .describe();

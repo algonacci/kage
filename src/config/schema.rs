@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default = "default_version")]
     pub version: u32,
+    /// API endpoints a role can be pointed at, keyed by the name roles refer to.
+    ///
+    /// Generic rather than one variant per vendor: every provider worth supporting speaks the
+    /// OpenAI shape, and the ones that do not are better served by a CLI harness than by a
+    /// special case here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, Provider>,
     #[serde(default)]
     pub roles: Roles,
     /// `loop` is a Rust keyword, so the field is renamed rather than raw-identified.
@@ -42,6 +49,17 @@ pub struct Roles {
     pub executor: RoleConfig,
     #[serde(default = "default_reviewer")]
     pub reviewer: RoleConfig,
+}
+
+impl Roles {
+    /// The configuration backing one role.
+    pub fn get(&self, role: crate::adapters::Role) -> &RoleConfig {
+        match role {
+            crate::adapters::Role::Planner => &self.planner,
+            crate::adapters::Role::Executor => &self.executor,
+            crate::adapters::Role::Reviewer => &self.reviewer,
+        }
+    }
 }
 
 impl Default for Roles {
@@ -79,6 +97,10 @@ pub struct RoleConfig {
     /// placeholders. The first element is the program.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    /// Which entry of `providers` backs this role. Required by, and only meaningful for,
+    /// `adapter: api`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     #[serde(default)]
     pub prompt_delivery: PromptDelivery,
     #[serde(default = "default_timeout_secs")]
@@ -107,6 +129,7 @@ impl RoleConfig {
             adapter,
             model: None,
             command: None,
+            provider: None,
             prompt_delivery: PromptDelivery::default(),
             timeout_secs: default_timeout_secs(),
             extra_args: None,
@@ -127,6 +150,103 @@ impl RoleConfig {
     }
 }
 
+impl Config {
+    /// Reject configurations that parse but cannot work.
+    ///
+    /// Checked when the config loads rather than when a role is first used: discovering that the
+    /// reviewer is unreachable at the review phase means a planner and an executor have already
+    /// been paid for.
+    pub fn validate(&self) -> Result<(), String> {
+        // The executor reads, edits, compiles, and re-runs tests. A completions endpoint returns
+        // text and nothing else, so backing the executor with one means Kage growing its own tool
+        // loop — which is to say, rebuilding the coding agents it exists to orchestrate.
+        if self.roles.executor.adapter == AdapterKind::Api {
+            return Err("the executor cannot be backed by `adapter: api`\n\
+                 it has to read, edit, and re-run tests, and an API endpoint only returns text — \
+                 supporting it would mean Kage growing its own tool loop, which is the one thing \
+                 it exists not to do\n\
+                 bind the executor to a CLI harness (claude-code, codex, opencode, kamui) and keep \
+                 the API adapter for the planner and reviewer"
+                .to_string());
+        }
+
+        for (role, config) in [
+            ("planner", &self.roles.planner),
+            ("executor", &self.roles.executor),
+            ("reviewer", &self.roles.reviewer),
+        ] {
+            if config.adapter != AdapterKind::Api {
+                continue;
+            }
+
+            let Some(name) = &config.provider else {
+                return Err(format!(
+                    "role `{role}` uses `adapter: api` but names no `provider`\n\
+                     add one under `providers:` and point the role at it"
+                ));
+            };
+
+            let Some(provider) = self.providers.get(name) else {
+                let known: Vec<&str> = self.providers.keys().map(String::as_str).collect();
+                return Err(format!(
+                    "role `{role}` names provider `{name}`, which is not declared under \
+                     `providers:` (known: {})",
+                    if known.is_empty() {
+                        "none".to_string()
+                    } else {
+                        known.join(", ")
+                    }
+                ));
+            };
+
+            if config.model.is_none() {
+                return Err(format!(
+                    "role `{role}` uses `adapter: api` but names no `model`\n\
+                     unlike a CLI harness, an endpoint has no configured default to fall back on"
+                ));
+            }
+
+            if provider.base_url.trim().is_empty() {
+                return Err(format!("provider `{name}` has an empty `base_url`"));
+            }
+
+            // One wire format exists today. Reading `kind` here is what keeps the field honest:
+            // adding a variant will fail to compile until the adapter learns to speak it, rather
+            // than silently sending OpenAI-shaped requests to something that is not.
+            match provider.kind {
+                ProviderKind::OpenaiCompatible => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// One API endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    /// Endpoint root, without the `/chat/completions` suffix.
+    pub base_url: String,
+    /// Name of the environment variable holding the key.
+    ///
+    /// The key itself is never written here. A config file gets committed, pasted into issues, and
+    /// read by the agents this tool spawns; a secret in it would leak through all three.
+    pub api_key_env: String,
+    /// Reserved for a second wire format. Only the OpenAI shape exists today, so this is accepted
+    /// and checked rather than silently ignored.
+    #[serde(default)]
+    pub kind: ProviderKind,
+}
+
+/// Wire formats a provider can speak.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    #[default]
+    OpenaiCompatible,
+}
+
 /// The CLI harnesses Kage knows how to spawn.
 ///
 /// `Command` is the generic escape hatch: any binary that accepts a prompt and edits files can fill
@@ -134,6 +254,8 @@ impl RoleConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdapterKind {
+    /// An HTTP endpoint rather than a local process. Only for roles whose deliverable is prose.
+    Api,
     ClaudeCode,
     Codex,
     /// Spelled as one word by the tool itself, so kebab-case would give the wrong key.
@@ -158,8 +280,9 @@ impl AdapterKind {
             Self::Codex => vec!["--sandbox".to_string(), "workspace-write".to_string()],
             // Kamui gates every tool call behind a prompt unless told otherwise.
             Self::Kamui => vec!["--auto-approve".to_string()],
-            // OpenCode carries out its own edits in `run` mode with no permission flag.
-            Self::OpenCode | Self::Command => Vec::new(),
+            // OpenCode carries out its own edits in `run` mode with no permission flag, and an API
+            // call has no argv at all.
+            Self::Api | Self::OpenCode | Self::Command => Vec::new(),
         }
     }
 }
@@ -167,6 +290,7 @@ impl AdapterKind {
 impl std::fmt::Display for AdapterKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
+            Self::Api => "api",
             Self::ClaudeCode => "claude-code",
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
@@ -322,6 +446,78 @@ mod tests {
         .unwrap();
 
         assert!(config.roles.planner.resolved_extra_args().is_empty());
+    }
+
+    /// A config with one provider declared and one role bound to it over the API.
+    fn api_config(role: &str, extra: &str) -> Config {
+        let yaml = format!(
+            "providers:\n  \
+             orvix:\n    \
+             base_url: 'https://api.orvix.id/v1'\n    \
+             api_key_env: K\n\
+             roles:\n  \
+             {role}:\n    \
+             adapter: api\n\
+             {extra}"
+        );
+        serde_yaml_ng::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn the_executor_cannot_be_backed_by_an_endpoint() {
+        // The executor reads, edits, compiles and re-runs tests. Supporting it over a completions
+        // endpoint means Kage growing its own tool loop, which is the thing it exists not to do —
+        // so this is rejected outright rather than half-supported.
+        let config = api_config("executor", "    provider: orvix\n    model: m\n");
+
+        let error = config.validate().unwrap_err();
+
+        assert!(error.contains("executor cannot be backed"), "{error}");
+        assert!(error.contains("tool loop"), "{error}");
+        assert!(error.contains("opencode"), "the remedy must name a way out");
+    }
+
+    #[test]
+    fn planner_and_reviewer_may_be_backed_by_an_endpoint() {
+        for role in ["planner", "reviewer"] {
+            let config = api_config(role, "    provider: orvix\n    model: m\n");
+            assert!(config.validate().is_ok(), "{role} should be allowed");
+        }
+    }
+
+    #[test]
+    fn an_api_role_must_name_a_provider_that_exists() {
+        let missing = api_config("planner", "    model: m\n");
+        assert!(
+            missing
+                .validate()
+                .unwrap_err()
+                .contains("names no `provider`")
+        );
+
+        let unknown = api_config("planner", "    provider: nope\n    model: m\n");
+        let error = unknown.validate().unwrap_err();
+        assert!(error.contains("not declared"), "{error}");
+        assert!(
+            error.contains("known: orvix"),
+            "the message must list what is available"
+        );
+    }
+
+    #[test]
+    fn an_api_role_must_name_a_model() {
+        // Unlike a CLI harness, an endpoint has no configured default to fall back on.
+        let config = api_config("planner", "    provider: orvix\n");
+
+        assert!(config.validate().unwrap_err().contains("names no `model`"));
+    }
+
+    #[test]
+    fn a_cli_only_config_needs_no_providers() {
+        let config: Config = serde_yaml_ng::from_str("{}").unwrap();
+
+        assert!(config.validate().is_ok());
+        assert!(config.providers.is_empty());
     }
 
     #[test]

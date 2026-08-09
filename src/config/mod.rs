@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-pub use schema::{AdapterKind, Config, PromptDelivery, RoleConfig, Roles, Validation};
+pub use schema::{AdapterKind, Config, PromptDelivery, Provider, RoleConfig, Roles, Validation};
 
 /// Directory name that marks a Kage project, mirroring `.git`.
 pub const KAGE_DIR: &str = ".kage";
@@ -67,8 +67,15 @@ impl Project {
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("cannot read {}", path.display()))?;
 
-        serde_yaml_ng::from_str(&raw)
-            .with_context(|| format!("invalid config at {}", path.display()))
+        let config: Config = serde_yaml_ng::from_str(&raw)
+            .with_context(|| format!("invalid config at {}", path.display()))?;
+
+        config
+            .validate()
+            .map_err(|reason| anyhow::anyhow!("{reason}"))
+            .with_context(|| format!("invalid config at {}", path.display()))?;
+
+        Ok(config)
     }
 
     /// Run ids are date-ordered and human-readable (`run_20260809_001`) so that sorting a directory
