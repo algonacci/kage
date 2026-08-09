@@ -183,6 +183,11 @@ short progress lines rather than JSON — and its log under `logs/` is written l
 If an agent goes silent for 30 seconds, Kage prints an elapsed-time line so a long think is not
 mistaken for a hang.
 
+A streaming harness keeps two files there: `<phase>.log` is the raw transcript of every event it
+emitted, and `<phase>.progress.log` — the path Kage prints — is the terminal's rendered view, so
+tailing it reads like the terminal instead of a wall of JSON. For every other harness the raw log
+is already readable and is the one announced.
+
 The reviewer must emit a machine-readable verdict. A review with no verdict blocks the run rather
 than being guessed at, because guessing `PASS` would let unreviewed code through.
 

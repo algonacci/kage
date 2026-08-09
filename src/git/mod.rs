@@ -32,6 +32,7 @@ pub async fn git(workdir: &Path, args: &[&str]) -> Result<String> {
         stdout_format: crate::adapters::stream::OutputFormat::Passthrough,
         heartbeat: None,
         log_path: None,
+        progress_path: None,
     })
     .await
     .context("cannot run git")?;

@@ -81,6 +81,13 @@ pub struct Spawn {
     pub heartbeat: Option<Duration>,
     /// Combined stdout+stderr transcript, written even if the process is killed.
     pub log_path: Option<PathBuf>,
+    /// A second, human-readable view of the same run: the terminal's rendered lines, on disk.
+    ///
+    /// The raw transcript is deliberately never filtered — it once held the only surviving copy of
+    /// a plan — but a streaming harness buries it under machine events faster than anyone can
+    /// read. `Some` here is how a caller says "the raw log cannot serve the person tailing it";
+    /// for already-readable output it stays `None` rather than producing two identical files.
+    pub progress_path: Option<PathBuf>,
 }
 
 /// Run a process to completion, capturing output and enforcing a timeout.
@@ -146,6 +153,14 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         )?))),
         None => None,
     };
+    let progress = match &spawn.progress_path {
+        Some(path) => Some(Arc::new(Mutex::new(LogWriter::create(
+            path,
+            &spawn.program,
+            &spawn.args,
+        )?))),
+        None => None,
+    };
 
     // Milliseconds since the run started when output last arrived. The heartbeat reads it; the
     // drains publish it. It is shared rather than pushed through a channel because tokio's `sync`
@@ -156,6 +171,8 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
     let err_prefix = spawn.stream_prefix.clone();
     let stdout_log = log.clone();
     let stderr_log = log.clone();
+    let stdout_progress = progress.clone();
+    let stderr_progress = progress.clone();
     let stdout_last = last_output.clone();
     let stderr_last = last_output.clone();
 
@@ -167,6 +184,7 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
                 format: spawn.stdout_format,
                 log_tag: "",
                 log: stdout_log,
+                progress: stdout_progress,
                 started,
                 last_output: stdout_last,
             },
@@ -178,10 +196,12 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
             stderr,
             Drain {
                 prefix: err_prefix,
-                // Stderr of every harness is human error text, never JSON events.
+                // Stderr of every harness is human error text, never JSON events. It reaches the
+                // progress view too: a crash message must not be invisible to the person tailing.
                 format: stream::OutputFormat::Passthrough,
                 log_tag: "[stderr] ",
                 log: stderr_log,
+                progress: stderr_progress,
                 started,
                 last_output: stderr_last,
             },
@@ -195,6 +215,7 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
             .clone()
             .unwrap_or_else(|| "  ".to_string());
         let heartbeat_last = last_output.clone();
+        let heartbeat_progress = progress.clone();
         let heartbeat_started = started;
         let timeout = spawn.timeout;
         tokio::spawn(async move {
@@ -209,7 +230,15 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
                 let elapsed = heartbeat_started.elapsed();
                 let last_output = Duration::from_millis(heartbeat_last.load(Ordering::Relaxed));
                 if heartbeat_due(elapsed, last_output, interval) {
-                    println!("{}", heartbeat_line(&prefix, elapsed, timeout));
+                    let line = heartbeat_line(&prefix, elapsed, timeout);
+                    println!("{line}");
+                    // A streaming harness can think in silence for minutes, and during that
+                    // silence the progress view is all a tailing user has. The raw transcript
+                    // never gets this line: it records what the harness emitted, not what Kage
+                    // said about it.
+                    if let Some(progress) = &heartbeat_progress {
+                        lock_log(progress, |writer| writer.line("", line.trim_start()));
+                    }
                 }
             }
         })
@@ -270,7 +299,7 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         )
     };
 
-    if let Some(log) = &log {
+    if log.is_some() || progress.is_some() {
         let finished = Outcome {
             code: status.and_then(|status| status.code()),
             stdout: stdout.clone(),
@@ -279,7 +308,12 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
             duration: started.elapsed(),
         }
         .describe();
-        lock_log(log, |writer| writer.finish(&finished));
+        if let Some(log) = &log {
+            lock_log(log, |writer| writer.finish(&finished));
+        }
+        if let Some(progress) = &progress {
+            lock_log(progress, |writer| writer.finish(&finished));
+        }
     }
 
     Ok(Outcome {
@@ -326,6 +360,9 @@ struct Drain {
     format: stream::OutputFormat,
     log_tag: &'static str,
     log: Option<Arc<Mutex<LogWriter>>>,
+    /// The rendered view, shared with the other drain and the heartbeat. `None` for a run whose
+    /// raw log is already the readable one.
+    progress: Option<Arc<Mutex<LogWriter>>>,
     started: Instant,
     last_output: Arc<AtomicU64>,
 }
@@ -354,6 +391,16 @@ where
             for display in &rendered.display {
                 println!("{prefix} {display}");
             }
+        }
+        // The progress view keeps what the terminal shows, so `tail -f` and the terminal agree.
+        if let Some(progress) = &ctx.progress
+            && !rendered.display.is_empty()
+        {
+            lock_log(progress, |writer| {
+                for display in &rendered.display {
+                    writer.line(ctx.log_tag, display);
+                }
+            });
         }
         if let Some(captured) = rendered.captured {
             collected.push_str(&captured);
@@ -409,6 +456,20 @@ impl LogWriter {
         let _ = writeln!(self.file, "\n--- {description} ---\n");
         let _ = self.file.flush();
     }
+}
+
+/// The rendered twin of a raw transcript: `executor.log` → `executor.progress.log`.
+///
+/// One derivation, used both by the adapter that writes the file and by the engine that announces
+/// it — computed twice from two rules, the announced path and the written path would drift apart,
+/// and the user would tail a file nothing writes to.
+pub fn progress_path(log_path: &Path) -> PathBuf {
+    let stem = log_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    log_path.with_file_name(format!("{stem}.progress.log"))
 }
 
 /// How often a silent child is reported as still alive.
@@ -645,6 +706,7 @@ pub fn shell_spawn(command: &str, workdir: PathBuf, timeout: Duration) -> Spawn 
         stdout_format: stream::OutputFormat::Passthrough,
         heartbeat: None,
         log_path: None,
+        progress_path: None,
     }
 }
 
@@ -665,6 +727,7 @@ mod tests {
             stdout_format: stream::OutputFormat::Passthrough,
             heartbeat: None,
             log_path: None,
+            progress_path: None,
         }
     }
 
@@ -1001,6 +1064,107 @@ mod tests {
         assert_eq!(beating.stdout, plain.stdout);
         assert_eq!(beating.code, plain.code);
         assert_eq!(beating.success(), plain.success());
+    }
+
+    #[tokio::test]
+    async fn a_streaming_run_writes_a_readable_progress_view_beside_the_raw_transcript() {
+        // The gap this closes: a claude planning phase writes hundreds of kilobytes of JSON
+        // events, so the raw transcript — kept deliberately, it once held the only surviving copy
+        // of a plan — cannot also serve the person tailing it. The progress view is the terminal's
+        // rendering written to disk: prose lines, stderr, and how the run ended, never envelopes.
+        let dir = std::env::temp_dir().join(format!("kage-proc-progress-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("executor.log");
+        let progress = dir.join("executor.progress.log");
+
+        let event = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"progress-marker"}]}}"#;
+        let command = if cfg!(windows) {
+            format!("echo {event} & echo stderr-marker 1>&2")
+        } else {
+            format!("echo '{event}'; echo stderr-marker 1>&2")
+        };
+        let mut spawn = shell_spawn(&command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.stdout_format = stream::OutputFormat::ClaudeStreamJson;
+        spawn.log_path = Some(raw.clone());
+        spawn.progress_path = Some(progress.clone());
+
+        let outcome = run(spawn).await.unwrap();
+        assert!(outcome.success(), "{outcome:?}");
+
+        let raw_text = std::fs::read_to_string(&raw).unwrap();
+        assert!(
+            raw_text.contains(r#""type":"assistant""#),
+            "the raw transcript must keep the envelope untouched:\n{raw_text}"
+        );
+
+        let progress_text = std::fs::read_to_string(&progress).unwrap();
+        assert!(progress_text.contains("progress-marker"), "{progress_text}");
+        assert!(
+            !progress_text.contains(r#""type":"#),
+            "an envelope leaked into the readable view:\n{progress_text}"
+        );
+        assert!(
+            progress_text.contains("[stderr] stderr-marker"),
+            "a crash on stderr must reach the person tailing:\n{progress_text}"
+        );
+        assert!(
+            progress_text.contains("ok in"),
+            "the view must say how the run ended:\n{progress_text}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_progress_view_shows_a_heartbeat_while_the_harness_is_silent() {
+        // A thinking model emits only events the renderer ignores, so without the heartbeat the
+        // progress view goes exactly as silent as the terminal used to — and a silent tail is the
+        // failure this file exists to end. The raw transcript records what the harness emitted,
+        // never what Kage said about it, so the heartbeat must not appear there.
+        let dir = std::env::temp_dir().join(format!("kage-proc-pulse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("planner.log");
+        let progress = dir.join("planner.progress.log");
+
+        let command = if cfg!(windows) {
+            "ping -n 3 127.0.0.1"
+        } else {
+            "sleep 2"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.stdout_format = stream::OutputFormat::ClaudeStreamJson;
+        spawn.heartbeat = Some(Duration::from_millis(200));
+        spawn.log_path = Some(raw.clone());
+        spawn.progress_path = Some(progress.clone());
+
+        let outcome = run(spawn).await.unwrap();
+        assert!(outcome.success(), "{outcome:?}");
+
+        let progress_text = std::fs::read_to_string(&progress).unwrap();
+        assert!(
+            progress_text.contains("still working"),
+            "a silent phase must still show life to a tailing user:\n{progress_text}"
+        );
+        assert!(
+            !std::fs::read_to_string(&raw)
+                .unwrap()
+                .contains("still working"),
+            "the forensic record must hold only what the harness emitted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_progress_path_sits_beside_the_raw_log_it_renders() {
+        assert_eq!(
+            progress_path(Path::new("logs/executor.log")),
+            Path::new("logs/executor.progress.log")
+        );
+        assert_eq!(
+            progress_path(Path::new("logs/fix-2-account.log")),
+            Path::new("logs/fix-2-account.progress.log")
+        );
     }
 
     #[test]

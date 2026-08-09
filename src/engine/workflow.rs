@@ -699,18 +699,26 @@ async fn run_agent(
     prompt: String,
 ) -> Result<crate::adapters::AgentResult> {
     let log_path = artifacts.logs_dir().join(format!("{label}.log"));
-    // Create the file before announcing it (REV-002): the path is printed as an invitation to
+    // A streaming backend's transcript is machine events, so the file worth tailing is its
+    // rendered twin; for everything else the transcript itself is the readable one.
+    let progress = adapter.progress_log(&log_path);
+    // Create the files before announcing one (REV-002): the path is printed as an invitation to
     // tail it, and a `tail -f` issued the moment it appears must not race the spawn that would
     // otherwise create the file a beat later.
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if !log_path.exists() {
-        let _ = std::fs::File::create(&log_path);
+    for path in std::iter::once(&log_path).chain(progress.as_ref()) {
+        if !path.exists() {
+            let _ = std::fs::File::create(path);
+        }
     }
     // Point the user at the live copy inside the worktree — the one worth tailing — not the
     // mirror, which is only written when the phase ends.
-    println!("  log: {}", log_path.display());
+    println!(
+        "  log: {}",
+        progress.as_deref().unwrap_or(&log_path).display()
+    );
 
     adapter
         .run(AgentRequest {

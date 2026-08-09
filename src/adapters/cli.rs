@@ -162,6 +162,7 @@ impl AgentAdapter for CliAdapter {
 
         let stdin = matches!(self.delivery, PromptDelivery::Stdin).then(|| request.prompt.clone());
 
+        let progress_path = self.progress_log(&request.log_path);
         let outcome = proc::run(Spawn {
             program: program.clone(),
             args: args.to_vec(),
@@ -176,6 +177,7 @@ impl AgentAdapter for CliAdapter {
             // run from a frozen one.
             heartbeat: Some(proc::HEARTBEAT_INTERVAL),
             log_path: Some(request.log_path),
+            progress_path,
         })
         .await?;
 
@@ -195,6 +197,13 @@ impl AgentAdapter for CliAdapter {
             self.kind,
             self.template.first().map(String::as_str).unwrap_or("?")
         )
+    }
+
+    /// Only a streaming argv gets a rendered view; for every other harness the raw log is already
+    /// what a human would read, and a twin file would only raise "which one is real?".
+    fn progress_log(&self, log_path: &std::path::Path) -> Option<std::path::PathBuf> {
+        (self.stdout_format != stream::OutputFormat::Passthrough)
+            .then(|| proc::progress_path(log_path))
     }
 }
 
@@ -412,6 +421,33 @@ mod tests {
         let argv = rendered(&RoleConfig::preset(AdapterKind::ClaudeCode), "x");
 
         assert_eq!(output_format(&argv), stream::OutputFormat::ClaudeStreamJson);
+    }
+
+    #[test]
+    fn only_a_streaming_harness_asks_for_a_progress_view() {
+        // A streaming transcript is machine events, so the file a human tails must be its rendered
+        // twin. A passthrough harness's raw log is already readable, and answering with a path
+        // anyway would leave two identical files side by side.
+        let log = std::path::Path::new("logs/planner.log");
+
+        let claude = adapter(&RoleConfig::preset(AdapterKind::ClaudeCode));
+        assert_eq!(
+            claude.progress_log(log).as_deref(),
+            Some(std::path::Path::new("logs/planner.progress.log"))
+        );
+
+        for kind in [
+            AdapterKind::Codex,
+            AdapterKind::OpenCode,
+            AdapterKind::Kamui,
+        ] {
+            let plain = adapter(&RoleConfig::preset(kind));
+            assert_eq!(
+                plain.progress_log(log),
+                None,
+                "`{kind}` output is already readable; a twin file would only confuse"
+            );
+        }
     }
 
     #[test]

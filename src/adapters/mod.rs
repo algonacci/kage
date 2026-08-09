@@ -91,6 +91,18 @@ pub trait AgentAdapter: Send + Sync {
     fn writes_own_artifacts(&self) -> bool {
         true
     }
+
+    /// The file a human should tail to watch this backend live, when the raw transcript at
+    /// `log_path` cannot serve them.
+    ///
+    /// A streaming harness's transcript is machine events — kept whole as the forensic record, but
+    /// unreadable while it grows — so such a backend answers with a second file holding the
+    /// rendered view, and the engine announces that one. `None` means the raw log is already the
+    /// readable one; answering with a path anyway would leave two identical files side by side and
+    /// a user guessing which to trust.
+    fn progress_log(&self, _log_path: &std::path::Path) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Build the adapter a role is configured to use.

@@ -88,6 +88,14 @@ predicate (`Artifacts::has_content`) so a blank file cannot pass one and trip th
 **A review with no machine-readable verdict blocks the run.** Guessing PASS lets unreviewed code
 through; guessing FAIL burns an iteration on nothing.
 
+**The raw transcript is never filtered; a streaming phase gets a rendered twin instead.**
+`<label>.log` keeps every raw line — it once held the only surviving copy of a plan — but a claude
+planning phase buries it under hundreds of kilobytes of machine events, so the file a human is
+invited to tail is `<label>.progress.log`: the terminal's rendered lines, stderr, the heartbeat,
+and how the run ended. Only a streaming backend gets one (`AgentAdapter::progress_log`); for a
+passthrough harness the raw log is already readable and a twin would leave two identical files and
+a user guessing which to trust.
+
 **Validation runs in Kage's process, never inside an agent.** An agent reporting "tests pass" is a
 claim. An exit code is evidence.
 
@@ -198,10 +206,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **The live log is not readable while it is live.** Every raw line is kept deliberately — it is the
-  forensic record of what the harness emitted — but a claude planning phase writes hundreds of
-  kilobytes of `thinking_tokens` events, so the file cannot serve the human tailing it. One file is
-  being asked to do two incompatible jobs.
 - **`max_iterations` mixes two kinds of failure.** A build that will not compile and a review that
   found real problems spend the same budget, so three failed builds can exhaust the run before the
   reviewer has seen the code at all.
