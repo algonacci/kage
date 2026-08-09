@@ -190,16 +190,34 @@ impl Artifacts {
         Ok(())
     }
 
+    /// Whether an artifact is really there: present, and not blank.
+    ///
+    /// The gate that enforces an artifact and the placeholder that stands in for a missing one have
+    /// to ask the same question. When they did not, a whitespace-only file passed the gate and still
+    /// reached the next agent as "_(not produced — … is missing or empty)_", which is the failure the
+    /// gate exists to prevent.
+    pub fn has_content(&self, path: &Path) -> bool {
+        matches!(std::fs::read_to_string(path), Ok(content) if !content.trim().is_empty())
+    }
+
     /// Read an artifact for embedding into a downstream prompt, or a placeholder when the agent
     /// never wrote it. A missing artifact is a fact the next agent should see, not a hard error —
     /// the reviewer can still judge code that shipped without an EXECUTION.md.
     pub fn read_or_placeholder(&self, path: &Path) -> String {
-        match std::fs::read_to_string(path) {
-            Ok(content) if !content.trim().is_empty() => content,
-            _ => format!(
+        let missing = || {
+            format!(
                 "_(not produced — {} is missing or empty)_",
                 path.file_name().unwrap_or_default().to_string_lossy()
-            ),
+            )
+        };
+        if !self.has_content(path) {
+            return missing();
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            // The gate already read this file a moment ago; losing it to a race still yields a
+            // placeholder rather than an empty string that reads as a produced artifact.
+            Err(_) => missing(),
         }
     }
 }
@@ -356,6 +374,63 @@ mod tests {
 
         assert!(text.contains("PLAN.md"));
         assert!(text.contains("missing"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_blank_artifact_does_not_count_as_content() {
+        let (root, project) = project("has-content");
+        let artifacts = Artifacts::new(&project, "run_1");
+        artifacts.ensure_dirs().unwrap();
+
+        assert!(
+            !artifacts.has_content(&artifacts.execution()),
+            "an absent file has no content"
+        );
+
+        std::fs::write(artifacts.execution(), "   \n\t\n").unwrap();
+        assert!(
+            !artifacts.has_content(&artifacts.execution()),
+            "a whitespace-only file must count as missing"
+        );
+
+        std::fs::write(artifacts.execution(), "implemented the plan").unwrap();
+        assert!(artifacts.has_content(&artifacts.execution()));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_gate_and_the_placeholder_agree_on_what_missing_means() {
+        // Regression guard: when the gate asked `is_file()` while the placeholder triggered on
+        // blank content, a whitespace-only file passed one and still reached the next agent as
+        // "missing or empty" — the exact failure the gate exists to prevent. The two must never
+        // disagree, so this asserts the equivalence that keeps them honest.
+        let (root, project) = project("agree");
+        let artifacts = Artifacts::new(&project, "run_1");
+        artifacts.ensure_dirs().unwrap();
+
+        let cases = [(false, "absent"), (true, "blank"), (true, "real")];
+        let execution = artifacts.execution();
+
+        for (write, label) in cases {
+            match write {
+                false => {
+                    let _ = std::fs::remove_file(&execution);
+                }
+                true if label == "blank" => std::fs::write(&execution, " \n\t ").unwrap(),
+                _ => std::fs::write(&execution, "account of the work").unwrap(),
+            }
+
+            assert_eq!(
+                artifacts.has_content(&execution),
+                !artifacts
+                    .read_or_placeholder(&execution)
+                    .contains("missing or empty"),
+                "the gate and the placeholder disagree for {label} content"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&root);
     }
