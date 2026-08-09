@@ -387,12 +387,7 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
 
                 banner(&state, "REVIEW", &reviewer.describe());
 
-                let diff = match &state.base_commit {
-                    Some(base) => git::diff::since(&state.workdir, base)
-                        .await
-                        .unwrap_or_else(|error| format!("_(could not compute diff: {error})_")),
-                    None => "_(not a git repository — no diff available)_".to_string(),
-                };
+                let diff = review_diff(&state).await;
 
                 // A stale verdict from the previous iteration must not be mistaken for this one's.
                 let _ = std::fs::remove_file(artifacts.verdict());
@@ -558,6 +553,21 @@ fn save_reply(
     std::fs::write(path, &result.stdout).with_context(|| format!("cannot write {}", path.display()))
 }
 
+/// Everything the run changed, rendered for a prompt — or an honest note when there is no diff.
+///
+/// One function for both the reviewer and the account re-ask, so the account is always written
+/// against the same diff the review will weigh it against. A diff error degrades to a labelled
+/// placeholder rather than failing the phase: the artifacts still carry enough to judge, and a
+/// run should not die over a description of changes it can show in the worktree.
+async fn review_diff(state: &RunState) -> String {
+    match &state.base_commit {
+        Some(base) => git::diff::since(&state.workdir, base)
+            .await
+            .unwrap_or_else(|error| format!("_(could not compute diff: {error})_")),
+        None => "_(not a git repository — no diff available)_".to_string(),
+    }
+}
+
 /// The label for the re-ask's prompt and log, derived from the phase that asked.
 ///
 /// A distinct name per call site: sharing one would overwrite the log of whichever asked first,
@@ -605,14 +615,9 @@ async fn ensure_account(
 
     println!("  no EXECUTION.md — asking the executor for its account of the work");
 
-    // The same diff the reviewer would get; the account is written against the very thing the
-    // review is going to weigh it against.
-    let diff = match &state.base_commit {
-        Some(base) => git::diff::since(&state.workdir, base)
-            .await
-            .unwrap_or_else(|error| format!("_(could not compute diff: {error})_")),
-        None => "_(not a git repository — no diff available)_".to_string(),
-    };
+    // The account is written against the very thing the review is going to weigh it against;
+    // sharing `review_diff` is what makes that true rather than merely claimed.
+    let diff = review_diff(state).await;
 
     let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
     let prompt = prompts::account(&state.workdir, artifacts, brief(state), &diff, delivery);

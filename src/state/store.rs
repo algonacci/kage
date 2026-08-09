@@ -202,7 +202,9 @@ impl Artifacts {
 
     /// Read an artifact for embedding into a downstream prompt, or a placeholder when the agent
     /// never wrote it. A missing artifact is a fact the next agent should see, not a hard error —
-    /// the reviewer can still judge code that shipped without an EXECUTION.md.
+    /// a fixer can still work without TEST_RESULTS.md on disk. `EXECUTION.md` is the exception:
+    /// its gate fails the run before any prompt would embed its placeholder, so the reviewer never
+    /// judges against one.
     pub fn read_or_placeholder(&self, path: &Path) -> String {
         let missing = || {
             format!(
