@@ -47,6 +47,9 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
 
     println!("Run:     {}", state.id);
     println!("Task:    {}", state.task);
+    if state.skip_plan {
+        println!("Plan:    {}", workflow::PLANNING_SKIPPED);
+    }
     println!("Phase:   {}", state.phase);
     println!(
         "Fixes:   {} of {} used",
@@ -95,12 +98,12 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
         ("REVIEW.md", artifacts.review()),
         ("VERDICT.json", artifacts.verdict()),
     ] {
-        let mark = if path.is_file() {
-            "\u{2713}"
-        } else {
-            "\u{25cb}"
-        };
-        println!("  {mark} {label}");
+        let exists = path.is_file();
+        let mark = if exists { "\u{2713}" } else { "\u{25cb}" };
+        println!(
+            "  {mark} {label}{}",
+            artifact_note(label, exists, state.skip_plan)
+        );
     }
 
     if !state.history.is_empty() {
@@ -117,6 +120,17 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
 
     println!("\n{}", next_step(state));
     Ok(())
+}
+
+/// The trailing note on an artifact line, empty unless the artifact's absence needs explaining.
+///
+/// A `○` beside `PLAN.md` means "not produced", which for a run that never asked for a plan is the
+/// wrong fact — and the one this file exists to get right.
+fn artifact_note(label: &str, exists: bool, skip_plan: bool) -> String {
+    if label == "PLAN.md" && skip_plan && !exists {
+        return format!("  ({})", workflow::PLANNING_SKIPPED);
+    }
+    String::new()
 }
 
 /// What the user should do now.
@@ -201,5 +215,25 @@ mod tests {
     #[test]
     fn short_tasks_are_left_alone() {
         assert_eq!(truncate("short", 20), "short");
+    }
+
+    #[test]
+    fn a_skipped_plan_is_marked_skipped_rather_than_merely_missing() {
+        assert!(
+            artifact_note("PLAN.md", false, true).contains("skipped"),
+            "an absent PLAN.md on a plan-free run is explained, not silently missing"
+        );
+        assert!(
+            artifact_note("PLAN.md", false, false).is_empty(),
+            "a normal run's absent plan is just a missing artifact"
+        );
+        assert!(
+            artifact_note("PLAN.md", true, true).is_empty(),
+            "a PLAN.md that exists is shown as present even though planning was skipped"
+        );
+        assert!(
+            artifact_note("REVIEW.md", false, true).is_empty(),
+            "only PLAN.md carries the skipped note"
+        );
     }
 }

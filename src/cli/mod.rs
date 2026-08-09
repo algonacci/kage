@@ -125,6 +125,10 @@ fn report(state: &RunState) {
     println!("\n{}", "-".repeat(60));
     println!("Run {} finished: {}", state.id, state.phase);
 
+    if let Some(line) = planning_line(state) {
+        println!("{line}");
+    }
+
     if let Some(error) = &state.error {
         println!("\n{error}");
     }
@@ -136,6 +140,15 @@ fn report(state: &RunState) {
     }
 
     println!("\nDetails:  kage status {}", state.id);
+}
+
+/// The extra line the closing summary prints for a run that had no planning phase.
+///
+/// Without it the summary reads exactly like a run whose planner produced nothing.
+fn planning_line(state: &RunState) -> Option<String> {
+    state
+        .skip_plan
+        .then(|| format!("Planning: {}", workflow::PLANNING_SKIPPED))
 }
 
 /// Why a finished run's checkout must not be removed.
@@ -207,5 +220,27 @@ mod tests {
             branch: "kage/run_1".to_string(),
         });
         assert!(uncommitted_reason(&state).is_none());
+    }
+
+    #[test]
+    fn the_closing_summary_says_when_planning_was_skipped() {
+        let mut state = RunState::new(
+            "run_1".to_string(),
+            "task".to_string(),
+            PathBuf::from("."),
+            3,
+        );
+
+        assert_eq!(
+            planning_line(&state),
+            None,
+            "a normal run's summary must not claim planning was skipped"
+        );
+
+        state.skip_plan = true;
+        let line =
+            planning_line(&state).unwrap_or_else(|| panic!("a plan-free run must be announced"));
+        assert!(line.starts_with("Planning:"), "{line}");
+        assert!(line.contains("skipped"), "{line}");
     }
 }

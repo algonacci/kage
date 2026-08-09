@@ -86,14 +86,19 @@ pub fn not_ready(missing: &[String]) -> String {
     format!("Not ready: install or reconfigure {}.", missing.join(", "))
 }
 
-/// Fail unless every role can actually be spawned.
+/// Fail unless every role in `roles` can actually be spawned.
 ///
 /// Called before a run touches the disk, so a run that cannot finish leaves no run directory, no
-/// worktree, and no state file behind.
-pub fn check(config: &crate::config::Config) -> Result<()> {
+/// worktree, and no state file behind. Only the roles the run will actually spawn are checked: a
+/// run that skips planning must not be refused because a planner it never calls is not installed.
+pub fn check(config: &crate::config::Config, roles: &[Role]) -> Result<()> {
     let mut missing = Vec::new();
 
     for status in inspect(&config.roles) {
+        if !roles.contains(&status.role) {
+            continue;
+        }
+
         // A role that is misconfigured rather than missing has a better message of its own, and it
         // is worth more than reporting `<unconfigured>` as absent from PATH.
         crate::adapters::build(status.role, config)?;
@@ -143,6 +148,10 @@ mod tests {
             .into_owned()
     }
 
+    fn roles_to_check() -> Vec<Role> {
+        vec![Role::Planner, Role::Executor, Role::Reviewer]
+    }
+
     #[test]
     fn a_reachable_program_passes_the_check() {
         let roles = Roles {
@@ -151,7 +160,7 @@ mod tests {
             reviewer: role_step_with_program(&current_exe()),
         };
 
-        assert!(check(&config_with(roles)).is_ok());
+        assert!(check(&config_with(roles), &roles_to_check()).is_ok());
     }
 
     #[test]
@@ -162,7 +171,9 @@ mod tests {
             reviewer: role_step_with_program("kage-definitely-not-installed"),
         };
 
-        let error = check(&config_with(roles)).unwrap_err().to_string();
+        let error = check(&config_with(roles), &roles_to_check())
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains(
             "Not ready: install or reconfigure reviewer (kage-definitely-not-installed)."
@@ -177,7 +188,9 @@ mod tests {
             reviewer: role_step_with_program("kage-definitely-not-installed"),
         };
 
-        let error = check(&config_with(roles)).unwrap_err().to_string();
+        let error = check(&config_with(roles), &roles_to_check())
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("planner (kage-definitely-not-installed)"));
         assert!(error.contains("reviewer (kage-definitely-not-installed)"));
@@ -199,12 +212,37 @@ mod tests {
             reviewer: RoleConfig::preset(AdapterKind::Command),
         };
 
-        let error = check(&config_with(roles)).unwrap_err().to_string();
+        let error = check(&config_with(roles), &roles_to_check())
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("no `command`"));
         assert!(
             !error.contains(UNCONFIGURED),
             "<unconfigured> must never reach the remedy line: {error}"
+        );
+    }
+
+    #[test]
+    fn a_role_the_run_will_not_spawn_is_not_required() {
+        // The whole point of scoping preflight to the roles a run spawns: skipping planning must
+        // not be refused because the configured planner is not installed.
+        let roles = Roles {
+            planner: role_step_with_program("kage-definitely-not-installed"),
+            executor: role_step_with_program(&current_exe()),
+            reviewer: role_step_with_program(&current_exe()),
+        };
+        let config = config_with(roles);
+
+        assert!(
+            check(&config, &[Role::Executor, Role::Reviewer]).is_ok(),
+            "an unspawned planner must not refuse the run"
+        );
+
+        let error = check(&config, &roles_to_check()).unwrap_err().to_string();
+        assert!(
+            error.contains("planner (kage-definitely-not-installed)"),
+            "checking the planner names it: {error}"
         );
     }
 

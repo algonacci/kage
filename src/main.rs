@@ -55,6 +55,10 @@ enum Command {
         /// Let agents edit your working tree directly instead of an isolated worktree
         #[arg(long)]
         no_isolate: bool,
+
+        /// Skip planning: start at EXECUTE with the task as the executor's instruction
+        #[arg(long)]
+        skip_plan: bool,
     },
 
     /// Show a run's state, artifacts, and history
@@ -96,6 +100,7 @@ async fn main() -> Result<()> {
             task,
             max_iterations,
             no_isolate,
+            skip_plan,
         } => {
             cli::run(
                 &cwd,
@@ -103,6 +108,7 @@ async fn main() -> Result<()> {
                 Options {
                     max_iterations,
                     no_isolate,
+                    skip_plan,
                 },
             )
             .await
@@ -155,11 +161,23 @@ mod tests {
             Command::Run {
                 max_iterations,
                 no_isolate,
+                skip_plan,
                 ..
             } => {
                 assert_eq!(max_iterations, Some(5));
                 assert!(no_isolate);
+                assert!(!skip_plan, "absent by default");
             }
+            _ => panic!("expected the run command"),
+        }
+    }
+
+    #[test]
+    fn skip_plan_is_parsed() {
+        let args = Cli::try_parse_from(["kage", "run", "task", "--skip-plan"]).unwrap();
+
+        match args.command {
+            Command::Run { skip_plan, .. } => assert!(skip_plan),
             _ => panic!("expected the run command"),
         }
     }

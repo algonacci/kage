@@ -24,6 +24,44 @@ pub struct Options {
     pub max_iterations: Option<usize>,
     /// Force agents to run in the user's working tree instead of a worktree.
     pub no_isolate: bool,
+    /// Start at EXECUTE with the task as the executor's instruction, with no planning phase.
+    pub skip_plan: bool,
+}
+
+/// How a run with no planning phase is described, wherever it is described.
+///
+/// One string so the run banner, the closing summary, and `kage status` cannot drift into implying
+/// different things about the same run — and so none of them implies a plan was made.
+pub const PLANNING_SKIPPED: &str = "skipped — the task itself was the executor's instruction";
+
+/// Where a new run begins.
+///
+/// A run that skips planning enters at EXECUTE. Nothing else moves: TEST and REVIEW are what
+/// actually hold quality, and skipping the plan must not mean skipping the gate.
+fn first_phase(skip_plan: bool) -> Phase {
+    if skip_plan {
+        Phase::Executing
+    } else {
+        Phase::Planning
+    }
+}
+
+/// The roles a run will actually spawn, in loop order.
+fn required_roles(skip_plan: bool) -> Vec<Role> {
+    if skip_plan {
+        vec![Role::Executor, Role::Reviewer]
+    } else {
+        vec![Role::Planner, Role::Executor, Role::Reviewer]
+    }
+}
+
+/// What this run's executor implements and its reviewer judges against.
+fn brief(state: &RunState) -> prompts::Brief<'_> {
+    if state.skip_plan {
+        prompts::Brief::Request { task: &state.task }
+    } else {
+        prompts::Brief::Plan
+    }
 }
 
 /// Begin a new run and drive it to a terminal state.
@@ -34,8 +72,10 @@ pub async fn start(
     options: &Options,
 ) -> Result<RunState> {
     // Before anything is allocated on disk: a run that cannot reach one of its harnesses must cost
-    // nothing, and must not leave a half-run behind for the user to clean up.
-    preflight::check(config)?;
+    // nothing, and must not leave a half-run behind for the user to clean up. Only the roles the
+    // run will actually spawn are checked, so a skip-plan run is not refused for a planner it never
+    // calls.
+    preflight::check(config, &required_roles(options.skip_plan))?;
 
     let run_id = project.next_run_id(chrono::Local::now())?;
     let max_iterations = options
@@ -51,6 +91,9 @@ pub async fn start(
         project.root.clone(),
         max_iterations,
     );
+    // Recorded before the first save below, so a crash immediately after still leaves the fact on
+    // disk and a `kage resume` re-enters with the same plan-free prompts.
+    state.skip_plan = options.skip_plan;
 
     if isolate && in_repo {
         let worktree = git::worktree::create(
@@ -72,6 +115,10 @@ pub async fn start(
         // Isolation is the default, so silently running in the user's tree would be a surprise
         // with real consequences.
         println!("  ! not a git repository — agents will edit files in place, without isolation");
+    }
+
+    if state.skip_plan {
+        println!("  planning {PLANNING_SKIPPED}");
     }
 
     if in_repo {
@@ -98,7 +145,7 @@ pub async fn start(
 pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> Result<RunState> {
     // A resume spends no writes on a run that cannot reach its harnesses: the state file must stay
     // exactly as it was, so the run stays resumable once the harness is installed.
-    preflight::check(config)?;
+    preflight::check(config, &required_roles(state.skip_plan))?;
 
     // A worktree can be removed between runs; recreate it so a resumed run still has its checkout.
     if let Some(worktree) = &state.worktree
@@ -225,7 +272,6 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
     let artifacts = Artifacts::for_run(project, &state.id, &state.workdir);
     artifacts.ensure_dirs()?;
 
-    let planner = adapters::build(Role::Planner, config)?;
     let executor = adapters::build(Role::Executor, config)?;
     let reviewer = adapters::build(Role::Reviewer, config)?;
 
@@ -235,10 +281,18 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
 
         match state.phase {
             Phase::Created => {
-                state.transition(Phase::Planning, "starting");
+                let reason = if state.skip_plan {
+                    "starting at EXECUTE — no planning phase"
+                } else {
+                    "starting"
+                };
+                state.transition(first_phase(state.skip_plan), reason);
             }
 
             Phase::Planning => {
+                // Built here, not before the loop: a run that skips planning must not fail because
+                // a planner it never calls could not be constructed.
+                let planner = adapters::build(Role::Planner, config)?;
                 banner(&state, "PLAN", &planner.describe());
                 let delivery = prompts::Delivery::from_adapter(planner.writes_own_artifacts());
                 let prompt = prompts::planner(&state.task, &state.workdir, &artifacts, delivery);
@@ -266,7 +320,7 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
             Phase::Executing => {
                 banner(&state, "EXECUTE", &executor.describe());
                 let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
-                let prompt = prompts::executor(&state.workdir, &artifacts, delivery);
+                let prompt = prompts::executor(&state.workdir, &artifacts, brief(&state), delivery);
 
                 let result = run_agent(&*executor, &state, &artifacts, "executor", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
@@ -318,7 +372,8 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 let _ = std::fs::remove_file(artifacts.verdict());
 
                 let delivery = prompts::Delivery::from_adapter(reviewer.writes_own_artifacts());
-                let prompt = prompts::reviewer(&state.workdir, &artifacts, &diff, delivery);
+                let prompt =
+                    prompts::reviewer(&state.workdir, &artifacts, brief(&state), &diff, delivery);
                 let result = run_agent(&*reviewer, &state, &artifacts, "reviewer", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "reviewer") {
                     return fail(project, state, reason);
@@ -407,6 +462,7 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 let prompt = prompts::fixer(
                     &state.workdir,
                     &artifacts,
+                    brief(&state),
                     &verdict,
                     state.iteration,
                     state.max_iterations,
@@ -626,6 +682,46 @@ mod tests {
         assert_eq!(state.iteration, 2);
         assert_eq!(next_fix_phase(&mut state, "x"), None, "budget exhausted");
         assert_eq!(state.iteration, 2, "a refused attempt must not be counted");
+    }
+
+    #[test]
+    fn a_run_that_skips_planning_starts_at_execute() {
+        assert_eq!(first_phase(true), Phase::Executing);
+        assert_eq!(first_phase(false), Phase::Planning);
+    }
+
+    #[test]
+    fn a_run_that_skips_planning_needs_no_planner_installed() {
+        let skipped = required_roles(true);
+        assert!(skipped.contains(&Role::Executor));
+        assert!(skipped.contains(&Role::Reviewer));
+        assert!(
+            !skipped.contains(&Role::Planner),
+            "a skip-plan run never spawns the planner"
+        );
+
+        let planned = required_roles(false);
+        assert!(planned.contains(&Role::Planner));
+        assert!(planned.contains(&Role::Executor));
+        assert!(planned.contains(&Role::Reviewer));
+    }
+
+    #[test]
+    fn the_brief_follows_what_the_run_recorded() {
+        let mut state = state(3);
+        state.task = "health check".to_string();
+
+        state.skip_plan = true;
+        match brief(&state) {
+            prompts::Brief::Request { task } => assert_eq!(task, "health check"),
+            _ => panic!("a plan-free run must brief the executor with the request"),
+        }
+
+        state.skip_plan = false;
+        assert!(
+            matches!(brief(&state), prompts::Brief::Plan),
+            "a planned run must brief with the plan"
+        );
     }
 
     #[test]

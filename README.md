@@ -54,9 +54,24 @@ whether the project is ready.
 
 `kage run` exits non-zero when a run does not complete, so it chains into scripts and CI.
 
-Before the first phase, `kage run` and `kage resume` resolve the program behind every role and abort
-with the same report `kage doctor` gives if one is unreachable — so a run cannot spend a planner and
-an executor before discovering the reviewer was never installed.
+Before the first phase, `kage run` and `kage resume` resolve the program behind every role the run
+will actually spawn and abort with the same report `kage doctor` gives if one is unreachable — so a
+run cannot spend a planner and an executor before discovering the reviewer was never installed.
+
+### Skipping the plan
+
+Some tasks do not need an architect — the change is small, or its shape is already decided. For
+those:
+
+```bash
+kage run --skip-plan "Add a health check endpoint"
+```
+
+No planner is spawned and no `PLAN.md` is written. The executor implements the task directly,
+summarising what it changed in `EXECUTION.md`, and the reviewer judges the work against that same
+task. TEST, REVIEW, and the iteration budget run exactly as usual — skipping the plan does not skip
+the gate. `--skip-plan` is a flag, not a heuristic: the person typing the task already knows whether
+it needs design.
 
 ## Configuration
 
@@ -152,7 +167,7 @@ that crashes can be resumed and inspected afterwards.
 ```text
 .kage/runs/run_20260809_001/
 ├── REQUEST.md          what you asked for
-├── PLAN.md             the executable engineering contract
+├── PLAN.md             the executable engineering contract (absent when a run skips planning)
 ├── EXECUTION.md        what the executor says it did
 ├── TEST_RESULTS.md     what your test suite says actually happened
 ├── REVIEW.md           the reviewer's findings

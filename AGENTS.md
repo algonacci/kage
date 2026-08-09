@@ -102,6 +102,13 @@ must read, edit, compile and re-run tests, so backing it with a completions endp
 growing a tool loop here — rebuilding the agents Kage exists to orchestrate. `Config::validate`
 rejects that configuration outright rather than half-supporting it.
 
+**Planning is skipped by the user, never by a heuristic.** `kage run --skip-plan` starts the run at
+EXECUTE with the task as the executor's whole instruction. The person typing the task already knows
+whether it needs design, and a guess is expensive in both directions. TEST and REVIEW still run:
+skipping the plan must not mean skipping the gate. The executor and reviewer prompts are told there
+is no plan rather than handed an empty one — "PLAN.md is missing" reads to an agent as a fault to
+report, and to a reviewer as an invitation to return BLOCKED.
+
 ## Harness facts
 
 Invocations verified against each tool's own `--help`, not guessed. They are the piece most likely
@@ -184,9 +191,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **Planning is spent on tasks that do not need it.** A sixteen-minute architect once planned a
-  235-line change whose shape was already obvious from the repository. That inverts the premise:
-  expensive reasoning went to the cheap part. There is no way to skip the planner today.
 - **The executor often skips `EXECUTION.md`.** Only `PLAN.md` is enforced, so the reviewer receives
   a placeholder instead of what the executor claims it did and where it deviated.
 - **The live log is not readable while it is live.** Every raw line is kept deliberately — it is the

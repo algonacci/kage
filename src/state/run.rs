@@ -139,6 +139,13 @@ pub struct RunState {
     /// Completed fix attempts. Starts at 0; the first review failure pushes it to 1.
     pub iteration: usize,
     pub max_iterations: usize,
+    /// Whether the run started at EXECUTE with the task itself as the executor's instruction.
+    ///
+    /// Recorded rather than inferred from a missing `PLAN.md`: a plan that was written and then
+    /// lost with its worktree is not the same thing as a run that never asked for one, and neither
+    /// `kage status` nor the closing summary may present one as the other.
+    #[serde(default)]
+    pub skip_plan: bool,
     /// Directory the agents actually run in — the worktree when isolating, else the project root.
     pub workdir: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -180,6 +187,7 @@ impl RunState {
             phase: Phase::Created,
             iteration: 0,
             max_iterations,
+            skip_plan: false,
             workdir,
             worktree: None,
             base_commit: None,
@@ -266,6 +274,25 @@ mod tests {
             state.commit.is_none(),
             "older state files carry no commit record"
         );
+    }
+
+    #[test]
+    fn a_state_file_written_before_skippable_planning_still_loads() {
+        // A state file predating the `--skip-plan` flag has no `skip_plan` key and must still
+        // plan: `#[serde(default)]` yields `false`, so an old run is never retroactively marked
+        // plan-free the way an absent PLAN.md must not be either.
+        let json = r#"{ "id": "run_1",
+            "task": "add caching",
+            "created_at": "2026-08-09T00:00:00Z",
+            "updated_at": "2026-08-09T00:00:00Z",
+            "phase": "completed",
+            "iteration": 0,
+            "max_iterations": 3,
+            "workdir": "." }"#;
+
+        let state: RunState = serde_json::from_str(json).unwrap();
+
+        assert!(!state.skip_plan, "a predating state file must still plan");
     }
 
     #[test]
