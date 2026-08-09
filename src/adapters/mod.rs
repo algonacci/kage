@@ -5,6 +5,7 @@
 //! the same workflow runnable on entirely different setups.
 
 pub mod cli;
+pub mod preflight;
 pub mod proc;
 
 use std::path::PathBuf;

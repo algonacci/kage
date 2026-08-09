@@ -8,8 +8,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::adapters::proc;
-use crate::config::{AdapterKind, Project};
+use crate::adapters::{preflight, proc};
+use crate::config::Project;
 
 const CHECK: &str = "\u{2713}";
 const CROSS: &str = "\u{2717}";
@@ -44,25 +44,24 @@ pub async fn run(cwd: &Path) -> Result<()> {
 
     if let Some(config) = &config {
         println!("Roles");
-        for (role, role_config) in [
-            ("planner", &config.roles.planner),
-            ("executor", &config.roles.executor),
-            ("reviewer", &config.roles.reviewer),
-        ] {
-            let program = program_for(role_config);
-            let found = proc::resolve_program(&program).is_ok();
-            let mark = if found { CHECK } else { CROSS };
-            let model = role_config
+        for status in preflight::inspect(&config.roles) {
+            let mark = if status.found() { CHECK } else { CROSS };
+            let model = status
+                .config
                 .model
                 .as_deref()
                 .map(|model| format!(" · {model}"))
                 .unwrap_or_default();
 
-            println!("{mark} {role}  {}{model}", role_config.adapter);
-            println!("    `{program}`{}", if found { "" } else { "  not found" });
+            println!("{mark} {}  {}{model}", status.role, status.config.adapter);
+            println!(
+                "    `{}`{}",
+                status.program,
+                if status.found() { "" } else { "  not found" }
+            );
 
-            if !found {
-                required_missing.push(format!("{role} ({program})"));
+            if !status.found() {
+                required_missing.push(status.label());
             }
         }
         println!();
@@ -88,32 +87,12 @@ pub async fn run(cwd: &Path) -> Result<()> {
         println!("git is required for isolated runs.");
     }
     if !required_missing.is_empty() {
-        println!(
-            "Not ready: install or reconfigure {}.",
-            required_missing.join(", ")
-        );
+        println!("{}", preflight::not_ready(&required_missing));
     } else if config.is_some() && git_ok {
         println!("Ready to run.");
     }
 
     Ok(())
-}
-
-/// The executable a role would actually spawn, including a custom `command` override.
-fn program_for(role: &crate::config::RoleConfig) -> String {
-    if let Some(command) = &role.command
-        && let Some(program) = command.first()
-    {
-        return program.clone();
-    }
-
-    match role.adapter {
-        AdapterKind::ClaudeCode => "claude".to_string(),
-        AdapterKind::Codex => "codex".to_string(),
-        AdapterKind::OpenCode => "opencode".to_string(),
-        AdapterKind::Kamui => "kamui".to_string(),
-        AdapterKind::Command => "<unconfigured>".to_string(),
-    }
 }
 
 fn report_tool(program: &str, install_hint: &str) -> bool {

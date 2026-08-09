@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::adapters::{self, AgentAdapter, AgentRequest, Role};
+use crate::adapters::{self, AgentAdapter, AgentRequest, Role, preflight};
 use crate::config::{Config, Project};
 use crate::engine::{gates, prompts, runner};
 use crate::git;
@@ -33,6 +33,10 @@ pub async fn start(
     task: &str,
     options: &Options,
 ) -> Result<RunState> {
+    // Before anything is allocated on disk: a run that cannot reach one of its harnesses must cost
+    // nothing, and must not leave a half-run behind for the user to clean up.
+    preflight::check(&config.roles)?;
+
     let run_id = project.next_run_id(chrono::Local::now())?;
     let max_iterations = options
         .max_iterations
@@ -92,6 +96,10 @@ pub async fn start(
 
 /// Continue an interrupted run from wherever its state file says it stopped.
 pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> Result<RunState> {
+    // A resume spends no writes on a run that cannot reach its harnesses: the state file must stay
+    // exactly as it was, so the run stays resumable once the harness is installed.
+    preflight::check(&config.roles)?;
+
     // A worktree can be removed between runs; recreate it so a resumed run still has its checkout.
     if let Some(worktree) = &state.worktree
         && !worktree.path.exists()
@@ -539,5 +547,92 @@ mod tests {
         assert!(hint.contains("kage/run_1"));
         assert!(hint.contains("git merge kage/run_1"));
         assert!(hint.contains("git diff abc123"));
+    }
+
+    /// Point a role at an arbitrary program (never spawned in these tests).
+    fn role_named(program: &str) -> crate::config::RoleConfig {
+        let mut role = crate::config::RoleConfig::preset(crate::config::AdapterKind::Command);
+        role.command = Some(vec![program.to_string()]);
+        role
+    }
+
+    /// A fresh project whose planner and executor point at this test binary (guaranteed to exist)
+    /// and whose reviewer names a program that cannot be found.
+    fn project_with_a_missing_reviewer(
+        label: &str,
+    ) -> (std::path::PathBuf, Project, crate::config::Config) {
+        let root =
+            std::env::temp_dir().join(format!("kage-workflow-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::config::init(&root, true).unwrap();
+
+        let project = Project::discover(&root).unwrap();
+        let mut config = project.load_config().unwrap();
+        let exe = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        config.roles.planner = role_named(&exe);
+        config.roles.executor = role_named(&exe);
+        config.roles.reviewer = role_named("kage-definitely-not-installed");
+
+        (root, project, config)
+    }
+
+    #[tokio::test]
+    async fn a_missing_harness_aborts_before_the_run_directory_exists() {
+        let (root, project, config) = project_with_a_missing_reviewer("aborts");
+
+        let error = start(&project, &config, "task", &Options::default())
+            .await
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("Not ready"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            std::fs::read_dir(project.runs_dir()).unwrap().count(),
+            0,
+            "a blocked run must leave no run directory behind"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_missing_harness_leaves_a_resumable_run_untouched() {
+        let (root, project, config) = project_with_a_missing_reviewer("resume");
+
+        let mut state = crate::state::RunState::new(
+            "run_20260809_001".to_string(),
+            "task".to_string(),
+            root.clone(),
+            3,
+        );
+        state.transition(crate::state::Phase::Executing, "started");
+        store::save(&project, &state).unwrap();
+        let history_len = state.history.len();
+        assert_eq!(history_len, 1);
+
+        let error = resume(&project, &config, state).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("Not ready"),
+            "unexpected error: {error}"
+        );
+
+        let reloaded = store::load(&project, "run_20260809_001").unwrap();
+        assert_eq!(reloaded.phase, crate::state::Phase::Executing);
+        assert!(reloaded.error.is_none(), "no error may be recorded");
+        assert_eq!(
+            reloaded.history.len(),
+            history_len,
+            "a blocked resume must record nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

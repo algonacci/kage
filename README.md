@@ -54,6 +54,10 @@ whether the project is ready.
 
 `kage run` exits non-zero when a run does not complete, so it chains into scripts and CI.
 
+Before the first phase, `kage run` and `kage resume` resolve the program behind every role and abort
+with the same report `kage doctor` gives if one is unreachable — so a run cannot spend a planner and
+an executor before discovering the reviewer was never installed.
+
 ## Configuration
 
 Roles are bound to harnesses in `.kage/config.yaml`. The workflow never names a model.
