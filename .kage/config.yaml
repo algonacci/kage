@@ -12,6 +12,8 @@ roles:
   executor:
     adapter: opencode
     model: opencode/deepseek-v4-flash-free
+    # 30m proved too small for a three-part feature; the observability run finished at 33m44s.
+    timeout_secs: 3600
 
   reviewer:
     adapter: codex
