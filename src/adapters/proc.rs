@@ -217,16 +217,27 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
 
     let mut timed_out = false;
     let status = match tokio::time::timeout(spawn.timeout, child.wait()).await {
-        Ok(status) => status.context("cannot wait for child process")?,
+        Ok(status) => Some(status.context("cannot wait for child process")?),
         Err(_) => {
             timed_out = true;
-            // Kill the whole tree, then wait. `start_kill` alone terminates only the direct
-            // child, but coding-agent CLIs spawn helpers (node, MCP servers) that inherit the
-            // stdout pipe; when they outlive the child, the drain tasks keep waiting for EOF and
-            // a run that timed out at 30 minutes sits open for another 49 — observed twice, once
-            // on each role, before this existed.
-            kill_tree(&mut child).await;
-            child.wait().await.context("cannot reap timed-out child")?
+
+            // Everything past this point is bounded, because none of it is worth waiting on. A
+            // timeout is a decision already made: the child has spent its budget and its output
+            // will be discarded either way. Leaving the kill and the reap unbounded turned a
+            // one-hour budget into a three-hour-twenty-two-minute run — the deadline fired on
+            // time and then Kage waited for a process that had already been told to die.
+            //
+            // Killing the tree rather than the child is separate and still necessary: coding-agent
+            // CLIs spawn helpers that inherit the stdout pipe, and while those live the drains
+            // never see EOF.
+            let _ = tokio::time::timeout(KILL_GRACE, kill_tree(&mut child)).await;
+
+            match tokio::time::timeout(REAP_GRACE, child.wait()).await {
+                Ok(status) => Some(status.context("cannot reap timed-out child")?),
+                // Unreapable. The exit status is unknown and stays that way; `timed_out` is what
+                // the caller acts on, and pretending to a code would be worse than admitting none.
+                Err(_) => None,
+            }
         }
     };
 
@@ -261,7 +272,7 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
 
     if let Some(log) = &log {
         let finished = Outcome {
-            code: status.code(),
+            code: status.and_then(|status| status.code()),
             stdout: stdout.clone(),
             stderr: stderr.clone(),
             timed_out,
@@ -272,7 +283,7 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
     }
 
     Ok(Outcome {
-        code: status.code(),
+        code: status.and_then(|status| status.code()),
         stdout,
         stderr,
         timed_out,
@@ -411,6 +422,18 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Long enough for the tree-kill to close the pipes and the drains to flush; short enough that the
 /// one straggler taskkill missed cannot turn a 30-minute timeout into an 80-minute wait.
 const DRAIN_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the kill itself may take.
+///
+/// `taskkill` walks a process tree and normally returns in milliseconds; if it has not returned by
+/// now it is not going to, and waiting on it is what a timeout exists to prevent.
+const KILL_GRACE: Duration = Duration::from_secs(15);
+
+/// How long to wait for a killed child to actually die before giving up on its exit status.
+///
+/// A process can survive `/F` — a driver-blocked write, a debugger attached, a stuck NTFS handle.
+/// The run is over either way, so the wait is bounded and the status simply becomes unknown.
+const REAP_GRACE: Duration = Duration::from_secs(20);
 
 /// Kill a timed-out child and, on Windows, its whole process tree.
 ///
@@ -690,6 +713,34 @@ mod tests {
         assert!(outcome.timed_out);
         assert!(!outcome.success());
         assert!(outcome.describe().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_bounds_the_whole_run_and_not_just_the_wait() {
+        // The bug this guards: the deadline fired on time, then the kill and the reap after it were
+        // both unbounded, so a one-hour executor budget produced a three-hour-twenty-two-minute run.
+        // Everything after the deadline must be bounded, because a timeout is a decision already
+        // made and nothing past it is worth waiting for.
+        let command = if cfg!(windows) {
+            "start /B ping -n 120 127.0.0.1 & ping -n 120 127.0.0.1"
+        } else {
+            "sleep 120 & sleep 120"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.timeout = Duration::from_millis(500);
+
+        let started = std::time::Instant::now();
+        let outcome = run(spawn).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(outcome.timed_out);
+
+        // The deadline plus every grace that may legitimately follow it, and nothing more.
+        let ceiling = Duration::from_millis(500) + KILL_GRACE + REAP_GRACE + DRAIN_GRACE * 2;
+        assert!(
+            elapsed < ceiling,
+            "a timed-out run ran for {elapsed:?}, past its own ceiling of {ceiling:?}"
+        );
     }
 
     #[tokio::test]
