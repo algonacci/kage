@@ -109,8 +109,11 @@ pub async fn validate(workdir: &Path, validation: &Validation) -> Result<TestRep
 
         println!("  $ {executed}");
 
-        let outcome =
-            proc::run(proc::shell_spawn(&executed, workdir.to_path_buf(), timeout)).await?;
+        // A 15-minute `cargo test` is the same blank terminal as a thinking planner; the heartbeat
+        // is what tells a working suite from a hung one. Output still goes to TEST_RESULTS.md.
+        let mut spawn = proc::shell_spawn(&executed, workdir.to_path_buf(), timeout);
+        spawn.heartbeat = Some(proc::HEARTBEAT_INTERVAL);
+        let outcome = proc::run(spawn).await?;
         let passed = outcome.success();
 
         println!("    {}", outcome.describe());

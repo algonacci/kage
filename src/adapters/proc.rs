@@ -3,20 +3,29 @@
 //! Every external program Kage runs — coding agents, validation commands, git — goes through here,
 //! so timeout and logging behaviour is identical for all of them.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::time::MissedTickBehavior;
+
+use crate::adapters::stream;
 
 /// What came out of a child process.
 #[derive(Debug, Clone)]
 pub struct Outcome {
     /// `None` when the process was killed by a signal or by our timeout.
     pub code: Option<i32>,
+    /// What the child said, rendered — for a streaming harness this is the assistant's prose and
+    /// final message, not the JSON envelope. `gates::read` searches it for a verdict.
     pub stdout: String,
+    /// Always raw: harness errors are plain text and are never JSON-decoded.
     pub stderr: String,
     pub timed_out: bool,
     pub duration: Duration,
@@ -65,6 +74,11 @@ pub struct Spawn {
     pub timeout: Duration,
     /// Prefix for echoing the child's output to the terminal. `None` runs quietly.
     pub stream_prefix: Option<String>,
+    /// How to interpret stdout. A streaming harness emits JSON events; rendering them is what keeps
+    /// the terminal readable and keeps `Outcome.stdout` searchable for a verdict.
+    pub stdout_format: stream::OutputFormat,
+    /// How often to print an elapsed-time line while the child is silent. `None` prints none.
+    pub heartbeat: Option<Duration>,
     /// Combined stdout+stderr transcript, written even if the process is killed.
     pub log_path: Option<PathBuf>,
 }
@@ -121,10 +135,85 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
     let stdout = child.stdout.take().context("stdout unavailable")?;
     let stderr = child.stderr.take().context("stderr unavailable")?;
 
+    // The transcript must exist before the child has produced a single line, or it is empty for
+    // exactly as long as somebody wants to read it. Creation itself is checked — a bad path is a
+    // configuration error worth failing on up front; everything after it is best effort.
+    let log = match &spawn.log_path {
+        Some(path) => Some(Arc::new(Mutex::new(LogWriter::create(
+            path,
+            &spawn.program,
+            &spawn.args,
+        )?))),
+        None => None,
+    };
+
+    // Milliseconds since the run started when output last arrived. The heartbeat reads it; the
+    // drains publish it. It is shared rather than pushed through a channel because tokio's `sync`
+    // feature is not enabled and must not be added for the one producer value it saves.
+    let last_output = Arc::new(AtomicU64::new(0));
+
     let out_prefix = spawn.stream_prefix.clone();
     let err_prefix = spawn.stream_prefix.clone();
-    let stdout_task = tokio::spawn(async move { drain(stdout, out_prefix).await });
-    let stderr_task = tokio::spawn(async move { drain(stderr, err_prefix).await });
+    let stdout_log = log.clone();
+    let stderr_log = log.clone();
+    let stdout_last = last_output.clone();
+    let stderr_last = last_output.clone();
+
+    let stdout_task = tokio::spawn(async move {
+        drain(
+            stdout,
+            Drain {
+                prefix: out_prefix,
+                format: spawn.stdout_format,
+                log_tag: "",
+                log: stdout_log,
+                started,
+                last_output: stdout_last,
+            },
+        )
+        .await
+    });
+    let stderr_task = tokio::spawn(async move {
+        drain(
+            stderr,
+            Drain {
+                prefix: err_prefix,
+                // Stderr of every harness is human error text, never JSON events.
+                format: stream::OutputFormat::Passthrough,
+                log_tag: "[stderr] ",
+                log: stderr_log,
+                started,
+                last_output: stderr_last,
+            },
+        )
+        .await
+    });
+
+    let heartbeat = spawn.heartbeat.map(|interval| {
+        let prefix = spawn
+            .stream_prefix
+            .clone()
+            .unwrap_or_else(|| "  ".to_string());
+        let heartbeat_last = last_output.clone();
+        let heartbeat_started = started;
+        let timeout = spawn.timeout;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            // A starved loop must not burst a backlog of ticks into the terminal at once.
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            // The very first tick of a new interval completes immediately; without this skip an
+            // instant heartbeat would print at t=0.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let elapsed = heartbeat_started.elapsed();
+                let last_output = Duration::from_millis(heartbeat_last.load(Ordering::Relaxed));
+                if heartbeat_due(elapsed, last_output, interval) {
+                    println!("{}", heartbeat_line(&prefix, elapsed, timeout));
+                }
+            }
+        })
+    });
 
     let mut timed_out = false;
     let status = match tokio::time::timeout(spawn.timeout, child.wait()).await {
@@ -138,11 +227,25 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         }
     };
 
+    // No heartbeat may land after the phase summary; whichever way we got here, the child's fate
+    // is decided and the clock no longer means anything to the user.
+    if let Some(handle) = heartbeat {
+        handle.abort();
+    }
+
     let stdout = stdout_task.await.unwrap_or_default();
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if let Some(path) = &spawn.log_path {
-        write_log(path, &spawn.program, &spawn.args, &stdout, &stderr)?;
+    if let Some(log) = &log {
+        let finished = Outcome {
+            code: status.code(),
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
+            timed_out,
+            duration: started.elapsed(),
+        }
+        .describe();
+        lock_log(log, |writer| writer.finish(&finished));
     }
 
     Ok(Outcome {
@@ -152,6 +255,17 @@ pub async fn run(spawn: Spawn) -> Result<Outcome> {
         timed_out,
         duration: started.elapsed(),
     })
+}
+
+/// The lock on the shared transcript, released on every body exit.
+///
+/// Holds are never kept across an `.await` (clippy's `await_holding_lock` is denied by CI). A
+/// poisoned mutex is still worth writing to — a panicked drain must not lose the rest of the log.
+fn lock_log<T>(log: &Arc<Mutex<LogWriter>>, body: impl FnOnce(&mut LogWriter) -> T) -> T {
+    match log.lock() {
+        Ok(mut guard) => body(&mut guard),
+        Err(poisoned) => body(&mut poisoned.into_inner()),
+    }
 }
 
 /// Append a command line without the usual per-argument quoting.
@@ -172,11 +286,22 @@ fn append_raw(command: &mut Command, raw: &str) {
     }
 }
 
-/// Read a pipe to end-of-file, optionally echoing each line as it arrives.
+/// Everything one drain task needs to turn pipe lines into terminal lines, log lines, and capture.
+struct Drain {
+    prefix: Option<String>,
+    format: stream::OutputFormat,
+    log_tag: &'static str,
+    log: Option<Arc<Mutex<LogWriter>>>,
+    started: Instant,
+    last_output: Arc<AtomicU64>,
+}
+
+/// Read a pipe to end-of-file, logging, rendering, and accumulating each line as it arrives.
 ///
 /// Streaming matters for a loop that can run for half an hour: without it the user stares at a
-/// frozen terminal with no way to tell a working agent from a hung one.
-async fn drain<R>(reader: R, prefix: Option<String>) -> String
+/// frozen terminal with no way to tell a working agent from a hung one. Every line is flushed to
+/// the log immediately, so `tail -f` shows progress in real time rather than at exit.
+async fn drain<R>(reader: R, ctx: Drain) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -184,33 +309,95 @@ where
     let mut collected = String::new();
 
     while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(prefix) = &prefix {
-            println!("{prefix} {line}");
+        if let Some(log) = &ctx.log {
+            // The transcript keeps the *raw* line, never the rendered one — it is the record of
+            // exactly what the harness emitted, which is the first thing wanted when it misbehaves.
+            lock_log(log, |writer| writer.line(ctx.log_tag, &line));
         }
-        collected.push_str(&line);
-        collected.push('\n');
+
+        let rendered = stream::render(ctx.format, &line);
+        if let Some(prefix) = &ctx.prefix {
+            for display in &rendered.display {
+                println!("{prefix} {display}");
+            }
+        }
+        if let Some(captured) = rendered.captured {
+            collected.push_str(&captured);
+            collected.push('\n');
+        }
+
+        ctx.last_output
+            .store(ctx.started.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
     collected
 }
 
-fn write_log(
-    path: &Path,
-    program: &str,
-    args: &[String],
-    stdout: &str,
-    stderr: &str,
-) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("cannot create {}", parent.display()))?;
+/// The transcript, written as it arrives rather than at the end.
+///
+/// A log that only appears after the child exits is empty for exactly as long as somebody wants to
+/// read it — the whole planning phase. Every line is flushed so `tail -f` shows it immediately.
+struct LogWriter {
+    file: std::fs::File,
+}
+
+impl LogWriter {
+    /// Create (or truncate) the transcript and write its header.
+    ///
+    /// Truncating is deliberate: a resumed phase re-enters and its log must describe *this*
+    /// attempt, matching "every phase overwrites its artifact".
+    fn create(path: &Path, program: &str, args: &[String]) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+
+        let mut file = std::fs::File::create(path)
+            .with_context(|| format!("cannot create {}", path.display()))?;
+        let header = format!("$ {program} {}\n\n", args.join(" "));
+        file.write_all(header.as_bytes())
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("cannot flush {}", path.display()))?;
+
+        Ok(Self { file })
     }
 
-    let body = format!(
-        "$ {program} {}\n\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
-        args.join(" ")
-    );
-    std::fs::write(path, body).with_context(|| format!("cannot write {}", path.display()))
+    /// Append one line. Best effort: a failing write must not kill a working agent, and there is
+    /// no recovery mid-stream for one that does.
+    fn line(&mut self, tag: &str, text: &str) {
+        let _ = writeln!(self.file, "{tag}{text}");
+        let _ = self.file.flush();
+    }
+
+    /// Record how the process ended, so a truncated log is distinguishable from a killed child.
+    fn finish(&mut self, description: &str) {
+        let _ = writeln!(self.file, "\n--- {description} ---\n");
+        let _ = self.file.flush();
+    }
+}
+
+/// How often a silent child is reported as still alive.
+///
+/// Long enough not to clutter a chatty run, short enough that a user does not conclude the terminal
+/// is frozen while the agent thinks.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Whether a tick should print, given how long the child has been quiet.
+///
+/// The child is quiet for `elapsed - last_output`; enough unanswered ticks mean a pulse is owed,
+/// whatever the child is doing — including printing nothing at all.
+fn heartbeat_due(elapsed: Duration, last_output: Duration, interval: Duration) -> bool {
+    elapsed >= last_output + interval
+}
+
+/// `  [planner] still working — 4m12s elapsed of 30m00s`
+fn heartbeat_line(prefix: &str, elapsed: Duration, timeout: Duration) -> String {
+    format!(
+        "{prefix} still working — {} elapsed of {}",
+        stream::brief_duration(elapsed),
+        stream::brief_duration(timeout)
+    )
 }
 
 /// A program resolved to something the OS can actually execute.
@@ -382,6 +569,8 @@ pub fn shell_spawn(command: &str, workdir: PathBuf, timeout: Duration) -> Spawn 
         raw_command: Some(command.to_string()),
         timeout,
         stream_prefix: None,
+        stdout_format: stream::OutputFormat::Passthrough,
+        heartbeat: None,
         log_path: None,
     }
 }
@@ -400,6 +589,8 @@ mod tests {
             raw_command: None,
             timeout: Duration::from_secs(30),
             stream_prefix: None,
+            stdout_format: stream::OutputFormat::Passthrough,
+            heartbeat: None,
             log_path: None,
         }
     }
@@ -567,5 +758,161 @@ mod tests {
 
         assert!(resolved.prefix_args.is_empty());
         assert_eq!(resolved.program, "/usr/bin/git");
+    }
+
+    #[tokio::test]
+    async fn the_log_file_is_readable_while_the_child_is_still_running() {
+        // Regression guard for the bug this change closes: the log used to be written in one shot
+        // only after the child exited, so it was empty for the entire planning phase somebody
+        // wanted to inspect. The marker must be on disk while the child is still alive.
+        let log = std::env::temp_dir().join(format!("kage-proc-live-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+
+        // Echo a marker, then block for ~2s (`ping` is the portable way to block on Windows).
+        let command = if cfg!(windows) {
+            "echo live-marker & ping -n 3 127.0.0.1"
+        } else {
+            "echo live-marker; sleep 2"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.log_path = Some(log.clone());
+
+        let child = tokio::spawn(run(spawn));
+
+        let marker_found = tokio::time::timeout(Duration::from_millis(1500), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&log)
+                    && text.contains("live-marker")
+                {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        assert_eq!(
+            marker_found,
+            Ok(true),
+            "the marker must appear before the child exits"
+        );
+
+        let outcome = child.await.unwrap().unwrap();
+        assert!(outcome.success(), "{outcome:?}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[tokio::test]
+    async fn the_log_keeps_stdout_and_stderr_apart() {
+        let log = std::env::temp_dir().join(format!("kage-proc-both-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+
+        let command = if cfg!(windows) {
+            "echo stdout-marker & echo stderr-marker 1>&2"
+        } else {
+            "echo stdout-marker; echo stderr-marker 1>&2"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.log_path = Some(log.clone());
+
+        run(spawn).await.unwrap();
+
+        let log_text = std::fs::read_to_string(&log).unwrap();
+        assert!(log_text.contains("stdout-marker"), "{log_text}");
+        // The stderr tag keeps the two streams' arrival order without making stdout un-greppable.
+        assert!(log_text.contains("[stderr] stderr-marker"), "{log_text}");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[tokio::test]
+    async fn the_log_records_how_the_process_ended() {
+        let ok_log = std::env::temp_dir().join(format!("kage-proc-ok-{}.log", std::process::id()));
+        let mut spawn = shell_spawn("exit 0", std::env::temp_dir(), Duration::from_secs(30));
+        spawn.log_path = Some(ok_log.clone());
+
+        run(spawn).await.unwrap();
+
+        assert!(
+            std::fs::read_to_string(&ok_log).unwrap().contains("ok in"),
+            "a finished run's log must say so"
+        );
+        let _ = std::fs::remove_file(&ok_log);
+
+        let timed_log =
+            std::env::temp_dir().join(format!("kage-proc-timed-{}.log", std::process::id()));
+        let command = if cfg!(windows) {
+            "ping -n 60 127.0.0.1"
+        } else {
+            "sleep 60"
+        };
+        let mut spawn = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        spawn.timeout = Duration::from_millis(500);
+        spawn.log_path = Some(timed_log.clone());
+
+        run(spawn).await.unwrap();
+
+        assert!(
+            std::fs::read_to_string(&timed_log)
+                .unwrap()
+                .contains("timed out"),
+            "a timed-out run's log must say so"
+        );
+        let _ = std::fs::remove_file(&timed_log);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_does_not_disturb_the_captured_output() {
+        let command = "echo heartbeat-does-not-echo";
+        let plain = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        let mut beating = shell_spawn(command, std::env::temp_dir(), Duration::from_secs(30));
+        beating.heartbeat = Some(Duration::from_millis(50));
+
+        let plain = run(plain).await.unwrap();
+        let beating = run(beating).await.unwrap();
+
+        assert_eq!(beating.stdout, plain.stdout);
+        assert_eq!(beating.code, plain.code);
+        assert_eq!(beating.success(), plain.success());
+    }
+
+    #[test]
+    fn a_silent_child_is_reported_as_still_working() {
+        assert!(heartbeat_due(
+            Duration::from_secs(60),
+            Duration::from_secs(0),
+            Duration::from_secs(30)
+        ));
+        assert!(heartbeat_due(
+            Duration::from_secs(31),
+            Duration::from_secs(1),
+            Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn a_talking_child_gets_no_heartbeat() {
+        assert!(!heartbeat_due(
+            Duration::from_secs(60),
+            Duration::from_secs(59),
+            Duration::from_secs(30)
+        ));
+        assert!(!heartbeat_due(
+            Duration::from_secs(29),
+            Duration::from_secs(0),
+            Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
+    fn the_heartbeat_names_the_elapsed_time_and_the_timeout() {
+        let line = heartbeat_line(
+            "  [planner]",
+            Duration::from_secs(252),
+            Duration::from_secs(1800),
+        );
+
+        assert!(line.contains("[planner]"), "{line}");
+        assert!(line.contains("4m12s"), "{line}");
+        assert!(line.contains("30m00s"), "{line}");
     }
 }

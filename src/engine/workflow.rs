@@ -472,12 +472,17 @@ async fn run_agent(
     label: &str,
     prompt: String,
 ) -> Result<crate::adapters::AgentResult> {
+    let log_path = artifacts.logs_dir().join(format!("{label}.log"));
+    // Point the user at the live copy inside the worktree — the one worth tailing — not the
+    // mirror, which is only written when the phase ends.
+    println!("  log: {}", log_path.display());
+
     adapter
         .run(AgentRequest {
             prompt,
             prompt_file: artifacts.prompts_dir().join(format!("{label}.md")),
             workdir: state.workdir.clone(),
-            log_path: artifacts.logs_dir().join(format!("{label}.log")),
+            log_path,
             label: label.to_string(),
         })
         .await

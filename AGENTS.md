@@ -42,7 +42,8 @@ src/
 │   ├── mod.rs           AgentAdapter trait, Role, the role -> backend seam
 │   ├── cli.rs           spawning coding-agent CLIs; per-harness argv presets
 │   ├── preflight.rs     resolve every role's program before a run spends anything
-│   └── proc.rs          all process spawning: capture, timeout, PATH, rtk routing
+│   ├── proc.rs          all process spawning: capture, timeout, PATH, rtk routing, live logs, heartbeat
+│   └── stream.rs        rendering a streaming harness's events as progress lines
 ├── state/
 │   ├── run.rs           RunState, Phase
 │   └── store.rs         atomic persistence, Artifacts and their worktree mirror
@@ -98,11 +99,15 @@ Invocations verified against each tool's own `--help`, not guessed. They are the
 to drift, which is why any role can override the whole argv with `command:`.
 
 ```text
-claude   --print [--model M] --permission-mode acceptEdits <prompt>
+claude   --print --output-format stream-json --verbose [--model M] --permission-mode acceptEdits <prompt>
 codex    exec [-m M] --sandbox workspace-write <prompt>
 opencode run [-m M] <prompt>
 kamui    -p <prompt> --auto-approve
 ```
+
+`--output-format stream-json` is what makes the planning phase observable at all: without it claude
+buffers its entire transcript until exit and the terminal shows nothing for the whole phase.
+`--verbose` is mandatory alongside it under `--print` — claude exits with an error without it.
 
 The permission flags are not optional. Without them the harness stops to ask a human who is not
 there, cannot write its deliverable, and the run dies having produced nothing.
@@ -167,9 +172,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 - **A completed run does not commit the agent's work.** The branch stays empty, the `git merge`
   instruction Kage prints is a no-op, and `kage clean` force-removes the worktree — destroying work
   it just told the user was safe. This is the most damaging open bug.
-- **`claude --print` does not stream**, so the terminal looks frozen for the whole planning phase.
-  The transcript is only written to `logs/` after the child exits, so the log is empty exactly when
-  it is needed, and there is no heartbeat to distinguish work from a hang.
 - **The executor often skips `EXECUTION.md`.** Only `PLAN.md` is enforced, so the reviewer receives
   a placeholder instead of what the executor claims it did.
 - **Agent failures dump raw harness output** — session ids, transport errors, prompt echoes — where

@@ -29,6 +29,8 @@ pub async fn git(workdir: &Path, args: &[&str]) -> Result<String> {
         raw_command: None,
         timeout: GIT_TIMEOUT,
         stream_prefix: None,
+        stdout_format: crate::adapters::stream::OutputFormat::Passthrough,
+        heartbeat: None,
         log_path: None,
     })
     .await

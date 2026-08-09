@@ -7,6 +7,7 @@
 pub mod cli;
 pub mod preflight;
 pub mod proc;
+pub mod stream;
 
 use std::path::PathBuf;
 

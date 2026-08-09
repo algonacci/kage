@@ -130,8 +130,14 @@ that crashes can be resumed and inspected afterwards.
 ├── VERDICT.json        PASS | FAIL | BLOCKED
 ├── state.json          resumable run state
 ├── prompts/            exactly what each agent was told
-└── logs/               what each agent printed
+└── logs/               what each agent printed, written live
 ```
+
+Each agent's output is streamed to the terminal as it arrives — claude's events are rendered as
+short progress lines rather than JSON — and its log under `logs/` is written line by line, so
+`tail -f` (or `Get-Content -Wait`) shows what the agent is doing while the phase is still running.
+If an agent goes silent for 30 seconds, Kage prints an elapsed-time line so a long think is not
+mistaken for a hang.
 
 The reviewer must emit a machine-readable verdict. A review with no verdict blocks the run rather
 than being guessed at, because guessing `PASS` would let unreviewed code through.

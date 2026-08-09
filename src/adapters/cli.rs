@@ -13,6 +13,7 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 
 use crate::adapters::proc::{self, Spawn};
+use crate::adapters::stream;
 use crate::adapters::{AgentAdapter, AgentRequest, AgentResult, Role};
 use crate::config::{AdapterKind, PromptDelivery, RoleConfig};
 
@@ -31,6 +32,8 @@ pub struct CliAdapter {
     delivery: PromptDelivery,
     timeout: Duration,
     env: Vec<(String, String)>,
+    /// How to interpret this argv's stdout, decided from the command line that will actually run.
+    stdout_format: stream::OutputFormat,
 }
 
 impl CliAdapter {
@@ -55,6 +58,7 @@ impl CliAdapter {
         Ok(Self {
             role,
             kind: config.adapter,
+            stdout_format: output_format(&template),
             template,
             delivery: config.prompt_delivery,
             timeout: Duration::from_secs(config.timeout_secs),
@@ -74,7 +78,15 @@ impl CliAdapter {
 /// the whole argv with `command:`.
 fn preset_template(kind: AdapterKind, model: Option<&str>) -> Vec<String> {
     let mut argv: Vec<String> = match kind {
-        AdapterKind::ClaudeCode => vec!["claude".into(), "--print".into()],
+        // `--verbose` is not optional: `claude --print --output-format stream-json` exits with an
+        // error without it. `stream-json` is what lets the phase be observed while it runs.
+        AdapterKind::ClaudeCode => vec![
+            "claude".into(),
+            "--print".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
+        ],
         AdapterKind::Codex => vec!["codex".into(), "exec".into()],
         AdapterKind::OpenCode => vec!["opencode".into(), "run".into()],
         // Verified against Kamui's own argument parser: `kamui -p <prompt> [--auto-approve]`.
@@ -97,6 +109,37 @@ fn preset_template(kind: AdapterKind, model: Option<&str>) -> Vec<String> {
 
     argv.push(PROMPT_PLACEHOLDER.to_string());
     argv
+}
+
+/// Which renderer this argv's stdout needs.
+///
+/// Decided from the command line that will actually run, not from the adapter kind: a user who
+/// overrides `command:` may spawn claude with or without streaming, and a different tool that
+/// grows an `--output-format stream-json` of its own must never be decoded with claude's schema.
+fn output_format(template: &[String]) -> stream::OutputFormat {
+    let asks_for_stream = template
+        .windows(2)
+        .any(|pair| pair[0] == "--output-format" && pair[1] == "stream-json")
+        || template
+            .iter()
+            .any(|arg| arg == "--output-format=stream-json");
+
+    if asks_for_stream && template.first().is_some_and(|program| is_claude(program)) {
+        stream::OutputFormat::ClaudeStreamJson
+    } else {
+        stream::OutputFormat::Passthrough
+    }
+}
+
+/// Whether an argv's program is the claude CLI, whatever its spelling.
+///
+/// The stem comparison is case-insensitive so `claude.cmd`, `claude.CMD`, and an absolute path all
+/// match — the shim resolution that actually runs the program happens later, in `proc::run`.
+fn is_claude(program: &str) -> bool {
+    std::path::Path::new(program)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("claude"))
 }
 
 #[async_trait]
@@ -127,6 +170,10 @@ impl AgentAdapter for CliAdapter {
             raw_command: None,
             timeout: self.timeout,
             stream_prefix: Some(format!("  [{}]", request.label)),
+            stdout_format: self.stdout_format,
+            // A thinking planner can sit silent for minutes; the heartbeat is what tells a working
+            // run from a frozen one.
+            heartbeat: Some(proc::HEARTBEAT_INTERVAL),
             log_path: Some(request.log_path),
         })
         .await?;
@@ -345,5 +392,67 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn claude_is_asked_to_stream_its_output() {
+        // Without these two flags the terminal shows nothing for the whole phase: claude buffers
+        // everything until exit unless `--output-format stream-json` is requested, and `--verbose`
+        // is required alongside it under `--print`.
+        let argv = rendered(&RoleConfig::preset(AdapterKind::ClaudeCode), "x");
+
+        let position = argv.iter().position(|a| a == "--output-format").unwrap();
+        assert_eq!(argv[position + 1], "stream-json");
+        assert!(argv.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn a_streaming_claude_has_its_events_decoded() {
+        let argv = rendered(&RoleConfig::preset(AdapterKind::ClaudeCode), "x");
+
+        assert_eq!(output_format(&argv), stream::OutputFormat::ClaudeStreamJson);
+    }
+
+    #[test]
+    fn a_harness_that_is_not_claude_is_passed_through_verbatim() {
+        for kind in [
+            AdapterKind::Codex,
+            AdapterKind::OpenCode,
+            AdapterKind::Kamui,
+        ] {
+            let argv = rendered(&RoleConfig::preset(kind), "x");
+            assert_eq!(
+                output_format(&argv),
+                stream::OutputFormat::Passthrough,
+                "`{kind}` output must not be decoded as claude events"
+            );
+        }
+
+        // Another program that happens to accept the same flags must never be mis-decoded.
+        let mut config = RoleConfig::preset(AdapterKind::Command);
+        config.command = Some(vec![
+            "my-agent".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            PROMPT_PLACEHOLDER.into(),
+        ]);
+        let argv = rendered(&config, "x");
+        assert_eq!(output_format(&argv), stream::OutputFormat::Passthrough);
+    }
+
+    #[test]
+    fn a_custom_command_spawning_claude_with_streaming_is_decoded() {
+        // A `command:` override that asks claude for events must get the claude renderer: both the
+        // `--output-format=stream-json` spelling and the `.cmd` stem have to match, or a user who
+        // configures streaming by hand is left with a wall of JSON.
+        let argv = vec![
+            "claude.cmd".to_string(),
+            "--print".to_string(),
+            "--output-format=stream-json".to_string(),
+            "--verbose".to_string(),
+            PROMPT_PLACEHOLDER.to_string(),
+        ];
+
+        assert_eq!(output_format(&argv), stream::OutputFormat::ClaudeStreamJson);
     }
 }
