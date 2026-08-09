@@ -4,6 +4,7 @@
 //! debuggable: every operation Kage performs is a command the user can paste into their own
 //! terminal to see exactly what happened.
 
+pub mod commit;
 pub mod diff;
 pub mod worktree;
 

@@ -68,6 +68,66 @@ pub struct Worktree {
     pub branch: String,
 }
 
+/// What became of the agent's work when the run stopped.
+///
+/// A run's branch is the only thing that outlives its worktree, so what did or did not reach that
+/// branch is the single most important fact in the closing summary — and the fact `kage clean` has
+/// to consult before it force-removes a checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Commitment {
+    /// The work is on the branch. `created` is false when the agent had already committed it
+    /// itself and Kage found nothing left to stage.
+    Committed {
+        sha: String,
+        branch: String,
+        files_changed: usize,
+        created: bool,
+    },
+    /// The run finished without changing a single file outside `.kage/`.
+    NothingToCommit { branch: String },
+    /// Git refused. The work exists only in the worktree, and removing that directory destroys it.
+    Failed { reason: String },
+}
+
+impl Commitment {
+    /// One line, for `kage status`.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Committed {
+                sha,
+                branch,
+                files_changed,
+                created: true,
+            } => format!(
+                "{} on `{branch}` ({} file(s))",
+                short_sha(sha),
+                files_changed
+            ),
+            Self::Committed {
+                sha,
+                branch,
+                files_changed,
+                created: false,
+            } => format!(
+                "{} on `{branch}` ({} file(s), committed by the agent)",
+                short_sha(sha),
+                files_changed
+            ),
+            Self::NothingToCommit { branch } => {
+                format!("nothing to commit — `{branch}` is unchanged")
+            }
+            Self::Failed { reason } => format!("not committed: {reason}"),
+        }
+    }
+}
+
+/// The first twelve characters of a commit sha, so a short or unusual sha cannot panic on a byte
+/// slice.
+fn short_sha(sha: &str) -> String {
+    sha.chars().take(12).collect::<String>()
+}
+
 /// Everything needed to describe, resume, or audit a run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -90,6 +150,11 @@ pub struct RunState {
     pub base_commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<Verdict>,
+    /// What Kage did with the working tree when the run stopped. `None` means no commit was
+    /// attempted: the run is still going, it ran without isolation, or its state file predates
+    /// commit-on-finish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<Commitment>,
     /// Why a run ended in `Failed` or `Blocked`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -119,6 +184,7 @@ impl RunState {
             worktree: None,
             base_commit: None,
             verdict: None,
+            commit: None,
             error: None,
             resume_from: None,
             history: Vec::new(),
@@ -177,5 +243,69 @@ mod tests {
         assert!(Phase::Blocked.is_terminal());
         assert!(!Phase::Fixing.is_terminal());
         assert!(!Phase::Created.is_terminal());
+    }
+
+    #[test]
+    fn a_state_file_written_before_commit_tracking_still_loads() {
+        let json = r#"{
+            "id": "run_1",
+            "task": "add caching",
+            "created_at": "2026-08-09T00:00:00Z",
+            "updated_at": "2026-08-09T00:00:00Z",
+            "phase": "completed",
+            "iteration": 0,
+            "max_iterations": 3,
+            "workdir": "."
+        }"#;
+
+        let state: RunState = serde_json::from_str(json).unwrap();
+
+        assert_eq!(state.id, "run_1");
+        assert_eq!(state.phase, Phase::Completed);
+        assert!(
+            state.commit.is_none(),
+            "older state files carry no commit record"
+        );
+    }
+
+    #[test]
+    fn each_commitment_describes_itself_for_status() {
+        assert_eq!(
+            Commitment::Committed {
+                sha: "0123456789abcdef".to_string(),
+                branch: "kage/run_1".to_string(),
+                files_changed: 3,
+                created: true,
+            }
+            .describe(),
+            "0123456789ab on `kage/run_1` (3 file(s))"
+        );
+
+        assert_eq!(
+            Commitment::Committed {
+                sha: "0123456789abcdef".to_string(),
+                branch: "kage/run_1".to_string(),
+                files_changed: 1,
+                created: false,
+            }
+            .describe(),
+            "0123456789ab on `kage/run_1` (1 file(s), committed by the agent)"
+        );
+
+        assert_eq!(
+            Commitment::NothingToCommit {
+                branch: "kage/run_1".to_string()
+            }
+            .describe(),
+            "nothing to commit — `kage/run_1` is unchanged"
+        );
+
+        assert_eq!(
+            Commitment::Failed {
+                reason: "git died".to_string()
+            }
+            .describe(),
+            "not committed: git died"
+        );
     }
 }

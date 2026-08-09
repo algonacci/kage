@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Project};
 use crate::engine::workflow::{self, Options};
-use crate::state::{Phase, RunState, store};
+use crate::state::{Commitment, Phase, RunState, store};
 
 /// `kage init` — scaffold `.kage/` in the current directory.
 pub fn init(cwd: &Path, force: bool) -> Result<()> {
@@ -65,7 +65,9 @@ pub async fn resume(cwd: &Path, run_id: Option<&str>) -> Result<()> {
 ///
 /// Every isolated run leaves a full checkout behind, so a repository worked on for a week quietly
 /// accumulates a dozen copies of itself. Only the checkout is removed: the `kage/<run_id>` branch
-/// survives, so work that was never merged is still recoverable afterwards.
+/// survives, so work that was never merged is still recoverable afterwards. A finished run whose
+/// work was never committed is kept — `--force` removal would destroy the only copy — unless
+/// `--all` is passed, which overrides every guard.
 pub async fn clean(cwd: &Path, all: bool) -> Result<()> {
     let project = Project::discover(cwd)?;
     let mut removed = 0usize;
@@ -83,6 +85,13 @@ pub async fn clean(cwd: &Path, all: bool) -> Result<()> {
             continue;
         }
         if !worktree.path.exists() {
+            continue;
+        }
+
+        // The branch only holds the work if it was committed there. Removing a checkout whose work
+        // never reached the branch destroys the work, so that checkout stays unless --all is given.
+        if !all && let Some(reason) = uncommitted_reason(&state) {
+            println!("kept {id}: {reason} — use --all to remove it anyway");
             continue;
         }
 
@@ -120,11 +129,27 @@ fn report(state: &RunState) {
         println!("\n{error}");
     }
 
-    if state.phase == Phase::Completed {
+    // A failed or blocked run may still have produced work worth recovering, so every terminal
+    // phase says where it went; `outcome_hint` handles all of them.
+    if state.phase.is_terminal() {
         println!("\n{}", workflow::outcome_hint(state));
     }
 
     println!("\nDetails:  kage status {}", state.id);
+}
+
+/// Why a finished run's checkout must not be removed.
+///
+/// `kage clean` tells the user the branch still holds the work. When the commit never happened
+/// that sentence is a lie and `--force` removal destroys the only copy, so the checkout stays.
+fn uncommitted_reason(state: &RunState) -> Option<String> {
+    match &state.commit {
+        Some(Commitment::Committed { .. }) | Some(Commitment::NothingToCommit { .. }) => None,
+        Some(Commitment::Failed { reason }) => {
+            Some(format!("its work was never committed ({reason})"))
+        }
+        None => Some("its work was never committed".to_string()),
+    }
 }
 
 /// Map a terminal phase to a process exit code.
@@ -142,4 +167,45 @@ fn exit_for(state: &RunState) -> Result<()> {
 /// Resolve the directory commands operate on.
 pub fn current_dir() -> Result<std::path::PathBuf> {
     std::env::current_dir().context("cannot determine the current directory")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_worktree_whose_work_was_never_committed_is_kept() {
+        let mut state = RunState::new(
+            "run_1".to_string(),
+            "task".to_string(),
+            PathBuf::from("."),
+            3,
+        );
+        assert_eq!(
+            uncommitted_reason(&state).unwrap(),
+            "its work was never committed"
+        );
+
+        state.commit = Some(Commitment::Failed {
+            reason: "git died".to_string(),
+        });
+        assert_eq!(
+            uncommitted_reason(&state).unwrap(),
+            "its work was never committed (git died)"
+        );
+
+        state.commit = Some(Commitment::Committed {
+            sha: "abc".to_string(),
+            branch: "kage/run_1".to_string(),
+            files_changed: 1,
+            created: true,
+        });
+        assert!(uncommitted_reason(&state).is_none());
+
+        state.commit = Some(Commitment::NothingToCommit {
+            branch: "kage/run_1".to_string(),
+        });
+        assert!(uncommitted_reason(&state).is_none());
+    }
 }

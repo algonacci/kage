@@ -49,7 +49,7 @@ whether the project is ready.
 | `kage status [run_id]` | Show a run's state, artifacts, and history |
 | `kage status --all` | List every run |
 | `kage resume [run_id]` | Continue an interrupted run |
-| `kage clean [--all]` | Remove worktree checkouts of finished runs (branches are kept) |
+| `kage clean [--all]` | Remove worktree checkouts of finished runs (branches are kept; a run whose work was never committed is kept unless `--all` is passed) |
 | `kage doctor` | Check which tools are available |
 
 `kage run` exits non-zero when a run does not complete, so it chains into scripts and CI.
@@ -149,7 +149,15 @@ git diff <base>            # review what the agents did
 git merge kage/run_20260809_001
 ```
 
-Use `--no-isolate` to let agents edit your working tree directly.
+When a run finishes — whether it completed, failed, or was blocked — Kage commits the worktree to
+`kage/<run_id>`, excluding Kage's own `.kage/` directory, so the branch really does hold the work
+after `kage clean` removes the checkout. The commit is a preservation snapshot: it skips hooks and
+signing (`--no-verify`, `commit.gpgsign=false`), so it can be amended, re-signed, or reworded before
+you merge it. It captures whatever the agents wrote, secrets and all — the same `.gitignore` and
+reviewer's diff that governed the run still apply, but the branch is a real commit of the tree.
+
+Use `--no-isolate` to let agents edit your working tree directly; Kage then commits nothing, so the
+changes stay uncommitted in your tree.
 
 ### RTK
 

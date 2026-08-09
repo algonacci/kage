@@ -18,7 +18,7 @@ const MAX_DIFF_CHARS: usize = 120_000;
 /// An isolated run writes its plan, review, and prompts inside the worktree so the agents can reach
 /// them. Without this the reviewer would be shown its own artifacts as if the executor had authored
 /// them, and every run would look like it touched `.kage/`.
-const EXCLUDE_KAGE: &str = ":(exclude).kage";
+pub(crate) const EXCLUDE_KAGE: &str = ":(exclude).kage";
 
 /// Everything that changed since `base_commit`, committed or not.
 ///

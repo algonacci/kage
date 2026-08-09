@@ -3,5 +3,5 @@
 pub mod run;
 pub mod store;
 
-pub use run::{Phase, RunState, Worktree};
+pub use run::{Commitment, Phase, RunState, Worktree};
 pub use store::Artifacts;

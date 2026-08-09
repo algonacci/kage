@@ -16,7 +16,7 @@ use crate::adapters::{self, AgentAdapter, AgentRequest, Role, preflight};
 use crate::config::{Config, Project};
 use crate::engine::{gates, prompts, runner};
 use crate::git;
-use crate::state::{Artifacts, Phase, RunState, store};
+use crate::state::{Artifacts, Commitment, Phase, RunState, store};
 
 /// Per-invocation overrides from the command line.
 #[derive(Debug, Clone, Default)]
@@ -124,10 +124,96 @@ pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> 
     }
 
     state.error = None;
+    // A previous attempt's commit record must not be reported as this attempt's result.
+    state.commit = None;
     state.transition(state.phase, format!("resumed at `{}`", state.phase));
     store::save(project, &state)?;
 
     drive(project, config, state).await
+}
+
+/// Drive the run, then put its work somewhere it can survive the worktree being deleted.
+///
+/// The state machine below has ten ways out; the commit must happen under all of them, so it lives
+/// on this single exit point rather than at each `fail`, `block`, or `break`. A run that ends in an
+/// error instead of a phase (`?` out of `run_phases`) is not terminal, stays resumable, and never
+/// commits.
+async fn drive(project: &Project, config: &Config, state: RunState) -> Result<RunState> {
+    let mut state = run_phases(project, config, state).await?;
+
+    if state.phase.is_terminal() {
+        finalize(&mut state).await;
+        store::save(project, &state)?;
+    }
+
+    Ok(state)
+}
+
+/// Commit the agent's work to the run's branch, and record what happened.
+///
+/// Never returns an error: a bookkeeping failure must not change a run's outcome. Every failure
+/// path becomes `Commitment::Failed`, which the closing summary prints and `kage clean` consults.
+async fn finalize(state: &mut RunState) {
+    let Some(worktree) = state.worktree.clone() else {
+        return; // Not isolated: committing would write to the branch the user has checked out.
+    };
+
+    let commitment = if let Some(base) = &state.base_commit {
+        if !worktree.path.exists() {
+            Commitment::Failed {
+                reason: "the worktree directory is gone".to_string(),
+            }
+        } else {
+            let (subject, body) = commit_message(state);
+            match crate::git::commit::commit_work(&worktree.path, base, &subject, &body).await {
+                Ok(committed) => committed,
+                Err(error) => Commitment::Failed {
+                    reason: format!("{error:#}"),
+                },
+            }
+        }
+    } else {
+        Commitment::Failed {
+            reason: "the run recorded no base commit".to_string(),
+        }
+    };
+
+    println!("  {}", commitment.describe());
+    state.commit = Some(commitment);
+}
+
+/// The commit message for a run's work: a subject git can display, and a body that says where the
+/// work came from.
+///
+/// The task reaches git as an argv element and Windows caps a command line at roughly 32k
+/// characters, so the task is truncated — a bound on the line, not a sanitisation.
+fn commit_message(state: &RunState) -> (String, String) {
+    let summary = state.task.split_whitespace().collect::<Vec<_>>().join(" ");
+    let summary = if summary.chars().count() > 50 {
+        let mut truncated = summary.chars().take(47).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    } else {
+        summary
+    };
+    let subject = format!("kage {}: {summary}", state.id);
+
+    let task = state.task.chars().take(2000).collect::<String>();
+    let verdict = match &state.verdict {
+        Some(verdict) => match verdict.verdict {
+            gates::VerdictKind::Pass => "PASS".to_string(),
+            gates::VerdictKind::Fail => "FAIL".to_string(),
+            gates::VerdictKind::Blocked => "BLOCKED".to_string(),
+        },
+        None => "none — the run did not reach review".to_string(),
+    };
+    let body = format!(
+        "Task: {task}\nPhase: {}\nVerdict: {verdict}\n\n\
+         Committed by Kage. Kage's own .kage/ directory is excluded from this commit.",
+        state.phase.as_str()
+    );
+
+    (subject, body)
 }
 
 /// The state machine.
@@ -135,7 +221,7 @@ pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> 
 /// Each phase persists its own state *before* doing any work, so a crash mid-phase resumes by
 /// re-entering that phase rather than skipping past it. Re-entry is safe because every phase
 /// overwrites its artifact instead of appending.
-async fn drive(project: &Project, config: &Config, mut state: RunState) -> Result<RunState> {
+async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> Result<RunState> {
     let artifacts = Artifacts::for_run(project, &state.id, &state.workdir);
     artifacts.ensure_dirs()?;
 
@@ -424,16 +510,38 @@ fn block(project: &Project, mut state: RunState, reason: String) -> Result<RunSt
 
 /// Where the finished work ended up, for the closing summary.
 pub fn outcome_hint(state: &RunState) -> String {
+    let base = state.base_commit.as_deref().unwrap_or("HEAD");
     match &state.worktree {
-        Some(worktree) => format!(
-            "changes are on branch `{}` in {}\n  review them with:  git diff {}\n  \
-             take them with:    git merge {}",
-            worktree.branch,
-            worktree.path.display(),
-            state.base_commit.as_deref().unwrap_or("HEAD"),
-            worktree.branch,
-        ),
         None => format!("changes were made in place at {}", state.workdir.display()),
+        Some(worktree) => match &state.commit {
+            Some(Commitment::Committed {
+                sha,
+                branch,
+                files_changed,
+                ..
+            }) => format!(
+                "{} file(s) committed as {} on branch `{branch}`\n  \
+                 review them with:  git diff {base} {branch}\n  \
+                 take them with:    git merge {branch}",
+                files_changed,
+                sha.chars().take(12).collect::<String>(),
+            ),
+            Some(Commitment::NothingToCommit { branch }) => {
+                format!("no changes were made — branch `{branch}` is unchanged")
+            }
+            Some(Commitment::Failed { reason }) => format!(
+                "the work could NOT be committed to `{}`: {reason}\n  \
+                 it exists only in {} — copy or commit it before `kage clean` removes that directory",
+                worktree.branch,
+                worktree.path.display(),
+            ),
+            None => format!(
+                "changes are in {} on branch `{}`, uncommitted\n  \
+                 review them with:  git diff {base}",
+                worktree.path.display(),
+                worktree.branch,
+            ),
+        },
     }
 }
 
@@ -534,19 +642,109 @@ mod tests {
     }
 
     #[test]
-    fn the_outcome_hint_names_the_branch_when_isolated() {
+    fn the_outcome_hint_names_the_commit_and_how_to_take_it() {
         let mut state = state(3);
         state.base_commit = Some("abc123".to_string());
         state.worktree = Some(crate::state::Worktree {
             path: PathBuf::from("/tmp/wt"),
             branch: "kage/run_1".to_string(),
         });
+        state.commit = Some(crate::state::Commitment::Committed {
+            sha: "0123456789abcdef".to_string(),
+            branch: "kage/run_1".to_string(),
+            files_changed: 2,
+            created: true,
+        });
 
         let hint = outcome_hint(&state);
 
-        assert!(hint.contains("kage/run_1"));
-        assert!(hint.contains("git merge kage/run_1"));
-        assert!(hint.contains("git diff abc123"));
+        assert!(hint.contains("0123456789ab"), "{hint}");
+        assert!(hint.contains("git diff abc123"), "{hint}");
+        assert!(hint.contains("git merge kage/run_1"), "{hint}");
+    }
+
+    #[test]
+    fn a_run_that_changed_nothing_does_not_offer_a_merge() {
+        let mut state = state(3);
+        state.base_commit = Some("abc123".to_string());
+        state.worktree = Some(crate::state::Worktree {
+            path: PathBuf::from("/tmp/wt"),
+            branch: "kage/run_1".to_string(),
+        });
+        state.commit = Some(crate::state::Commitment::NothingToCommit {
+            branch: "kage/run_1".to_string(),
+        });
+
+        let hint = outcome_hint(&state);
+
+        assert!(hint.contains("no changes were made"), "{hint}");
+        assert!(!hint.contains("git merge"), "{hint}");
+    }
+
+    #[test]
+    fn a_failed_commit_tells_the_user_where_the_work_still_is() {
+        let mut state = state(3);
+        state.worktree = Some(crate::state::Worktree {
+            path: PathBuf::from("/tmp/wt"),
+            branch: "kage/run_1".to_string(),
+        });
+        state.commit = Some(crate::state::Commitment::Failed {
+            reason: "git refused".to_string(),
+        });
+
+        let hint = outcome_hint(&state);
+
+        assert!(hint.contains("/tmp/wt"), "{hint}");
+        assert!(hint.contains("git refused"), "{hint}");
+        assert!(hint.contains("kage clean"), "{hint}");
+    }
+
+    #[test]
+    fn a_run_without_a_worktree_still_reports_changes_in_place() {
+        let state = state(3);
+
+        let hint = outcome_hint(&state);
+
+        assert!(hint.contains("changes were made in place"), "{hint}");
+    }
+
+    #[test]
+    fn the_commit_subject_is_one_short_line() {
+        let mut state = state(3);
+        state.task = format!("line one\nline two\n{}\n", "filler ".repeat(90));
+        state.verdict = Some(gates::Verdict {
+            verdict: gates::VerdictKind::Pass,
+            severity: None,
+            summary: None,
+            issues: Vec::new(),
+        });
+
+        let (subject, body) = commit_message(&state);
+
+        assert!(!subject.contains('\n'), "{subject}");
+        let summary = subject
+            .strip_prefix(&format!("kage {}: ", state.id))
+            .unwrap();
+        assert!(
+            summary.chars().count() <= 50,
+            "summary too long ({summary})"
+        );
+        assert!(
+            body.contains(&format!("Phase: {}", state.phase.as_str())),
+            "{body}"
+        );
+        assert!(body.contains("Verdict: PASS"), "{body}");
+    }
+
+    #[test]
+    fn the_commit_subject_survives_a_multibyte_task() {
+        let mut state = state(3);
+        state.task = "é".repeat(300);
+
+        let (subject, _body) = commit_message(&state);
+
+        assert!(!subject.contains('\n'), "{subject}");
+        assert!(subject.contains("..."), "{subject}");
     }
 
     /// Point a role at an arbitrary program (never spawned in these tests).

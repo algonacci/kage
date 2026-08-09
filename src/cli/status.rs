@@ -68,6 +68,10 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
         println!("Workdir: {}", state.workdir.display());
     }
 
+    if let Some(commit) = &state.commit {
+        println!("Commit:  {}", commit.describe());
+    }
+
     if let Some(verdict) = &state.verdict {
         println!("\nVerdict: {:?}", verdict.verdict);
         if let Some(summary) = &verdict.summary {
@@ -123,13 +127,15 @@ fn next_step(state: &RunState) -> String {
     match state.phase {
         Phase::Completed => format!("Completed. {}", workflow::outcome_hint(state)),
         Phase::Failed => format!(
-            "Failed. Inspect the logs in the run directory, then retry with:  kage resume {}",
-            state.id
+            "Failed. Inspect the logs in the run directory, then retry with:  kage resume {}\n{}",
+            state.id,
+            workflow::outcome_hint(state)
         ),
         Phase::Blocked => format!(
             "Blocked — this needs a human decision. Read REVIEW.md, then either fix the plan and \
-             run `kage resume {}`, or start a new run with a clearer task.",
-            state.id
+             run `kage resume {}`, or start a new run with a clearer task.\n{}",
+            state.id,
+            workflow::outcome_hint(state)
         ),
         _ => format!(
             "Interrupted while `{}`. Continue with:  kage resume {}",
@@ -168,6 +174,20 @@ mod tests {
         assert!(next_step(&state(Phase::Failed)).contains("kage resume"));
         assert!(next_step(&state(Phase::Blocked)).contains("human"));
         assert!(next_step(&state(Phase::Completed)).contains("Completed"));
+    }
+
+    #[test]
+    fn every_terminal_phase_reports_where_the_work_went() {
+        // `state()` builds a run with no worktree, so the outcome hint resolves to the
+        // "made in place" case; the point is that Failed and Blocked must carry it too, not that
+        // this fixture exercises every commitment variant.
+        for phase in [Phase::Failed, Phase::Blocked, Phase::Completed] {
+            let next = next_step(&state(phase));
+            assert!(
+                next.contains("changes were made in place"),
+                "phase {phase:?} omits the outcome hint:\n{next}"
+            );
+        }
     }
 
     #[test]
