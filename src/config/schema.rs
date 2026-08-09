@@ -317,16 +317,31 @@ pub enum PromptDelivery {
 }
 
 /// Bounds on the fix/review cycle.
+///
+/// Two budgets rather than one, because the loop meets two different kinds of failure. A build
+/// that does not compile is mechanical: an exit code catches it and the fix is usually small. A
+/// review rejection is judgment: it costs a premium model to obtain and is the loop's real
+/// currency. When both drew on one budget, three failed builds could exhaust the run before the
+/// reviewer had seen the code at all.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoopConfig {
-    /// How many fix attempts are allowed after the first review fails. Exhausting them fails the
-    /// run rather than looping forever.
+    /// How many times the reviewer may reject the work before the run fails. Exhausting these
+    /// fails the run rather than looping forever.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: usize,
+    /// How many attempts the executor gets to make validation pass before each review. The budget
+    /// refills when a review rejection opens a new fix cycle: every review's findings are a fresh
+    /// implementation job with the same right to a compiling result.
+    #[serde(default = "default_max_repairs")]
+    pub max_repairs: usize,
 }
 
 fn default_max_iterations() -> usize {
+    3
+}
+
+fn default_max_repairs() -> usize {
     3
 }
 
@@ -334,6 +349,7 @@ impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
+            max_repairs: default_max_repairs(),
         }
     }
 }
@@ -391,6 +407,7 @@ mod tests {
 
         assert_eq!(config.version, 1);
         assert_eq!(config.loop_config.max_iterations, 3);
+        assert_eq!(config.loop_config.max_repairs, 3);
         assert!(config.git.isolate);
         assert_eq!(config.roles.planner.adapter, AdapterKind::ClaudeCode);
         assert_eq!(config.roles.executor.adapter, AdapterKind::OpenCode);

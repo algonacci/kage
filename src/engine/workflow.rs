@@ -16,7 +16,7 @@ use crate::adapters::{self, AgentAdapter, AgentRequest, Role, preflight};
 use crate::config::{Config, Project};
 use crate::engine::{gates, prompts, runner};
 use crate::git;
-use crate::state::{Artifacts, Commitment, Phase, RunState, store};
+use crate::state::{Artifacts, Commitment, FixCause, Phase, RunState, store};
 
 /// Per-invocation overrides from the command line.
 #[derive(Debug, Clone, Default)]
@@ -91,6 +91,7 @@ pub async fn start(
         project.root.clone(),
         max_iterations,
     );
+    state.max_repairs = config.loop_config.max_repairs;
     // Recorded before the first save below, so a crash immediately after still leaves the fact on
     // disk and a `kage resume` re-enters with the same plan-free prompts.
     state.skip_plan = options.skip_plan;
@@ -365,11 +366,21 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 println!("  {summary}");
 
                 // Failing tests skip review entirely. Asking a reviewer to judge code that does not
-                // build spends a premium model to learn what an exit code already proved.
-                match next_fix_phase(&mut state, &summary) {
+                // build spends a premium model to learn what an exit code already proved. They
+                // charge the repair budget, not the iteration budget: a broken build is mechanical,
+                // and it must not eat the review cycles the run was given.
+                match next_repair_phase(&mut state) {
                     Some(phase) => state.transition(phase, summary),
                     None => {
-                        return fail(project, state, format!("{summary} — no fix attempts left"));
+                        let reason = format!(
+                            "{summary} — the executor spent all {} repair attempt(s) in this \
+                             cycle without a passing build, so the reviewer never saw the code\n\
+                             read TEST_RESULTS.md for what kept failing; raise `loop.max_repairs` \
+                             only if the failures were genuinely converging, otherwise the task \
+                             needs splitting or a clearer brief",
+                            state.max_repairs
+                        );
+                        return fail(project, state, reason);
                     }
                 }
             }
@@ -449,7 +460,7 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                     );
                 } else {
                     let summary = "review failed".to_string();
-                    match next_fix_phase(&mut state, &summary) {
+                    match next_fix_phase(&mut state) {
                         Some(phase) => state.transition(phase, summary),
                         None => {
                             return fail(
@@ -463,9 +474,20 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
             }
 
             Phase::Fixing => {
+                // A state file from before the split budget carries no cause; a verdict on disk
+                // means a review sent it here, because nothing else produces one.
+                let cause = state.fix_cause.unwrap_or(if state.verdict.is_some() {
+                    FixCause::Review
+                } else {
+                    FixCause::Validation
+                });
+                let (attempt, budget, cause_word) = match cause {
+                    FixCause::Validation => (state.repairs, state.max_repairs, "validation"),
+                    FixCause::Review => (state.iteration, state.max_iterations, "review"),
+                };
                 banner(
                     &state,
-                    &format!("FIX {}/{}", state.iteration, state.max_iterations),
+                    &format!("FIX {attempt}/{budget} ({cause_word})"),
                     &executor.describe(),
                 );
 
@@ -473,16 +495,13 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 // below measures the fix, not the run's first attempt.
                 let _ = std::fs::remove_file(artifacts.execution());
 
-                // Test failures reach this phase with no verdict, so an empty finding list is
-                // normal; the test results in the prompt carry the detail in that case.
-                let verdict = state.verdict.clone().unwrap_or(gates::Verdict {
-                    verdict: gates::VerdictKind::Fail,
-                    severity: None,
-                    summary: Some(
-                        "The validation commands failed. See the test results below.".to_string(),
-                    ),
-                    issues: Vec::new(),
-                });
+                // A validation failure briefs the fixer with the exit code's story alone. The
+                // previous review's findings are already addressed in the diff; re-presenting
+                // them as the reason would send the fixer back over finished work.
+                let verdict = match cause {
+                    FixCause::Review => state.verdict.clone().unwrap_or_else(validation_verdict),
+                    FixCause::Validation => validation_verdict(),
+                };
 
                 let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
                 let prompt = prompts::fixer(
@@ -490,12 +509,22 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                     &artifacts,
                     brief(&state),
                     &verdict,
-                    state.iteration,
-                    state.max_iterations,
+                    prompts::FixAttempt {
+                        cause,
+                        attempt,
+                        budget,
+                    },
                     delivery,
                 );
 
-                let label = format!("fix-{}", state.iteration);
+                // The repair budget resets each cycle, so a repair label carries the cycle number
+                // too — without it, cycle 2's `repair-1` would overwrite cycle 1's log.
+                let label = match cause {
+                    FixCause::Review => format!("fix-{}", state.iteration),
+                    FixCause::Validation => {
+                        format!("repair-{}-{}", state.iteration, state.repairs)
+                    }
+                };
                 let result = run_agent(&*executor, &state, &artifacts, &label, prompt).await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
                     return fail(project, state, reason);
@@ -647,12 +676,45 @@ async fn ensure_account(
     }
 }
 
-/// Spend an iteration on a fix, or report that none remain.
-fn next_fix_phase(state: &mut RunState, _reason: &str) -> Option<Phase> {
+/// The stand-in verdict for a fix that validation, not a reviewer, asked for.
+///
+/// Test failures reach the FIX phase with no verdict of their own, and a fix cycle's later build
+/// breakage must not inherit the review's — so both get this, and the test results in the prompt
+/// carry the detail.
+fn validation_verdict() -> gates::Verdict {
+    gates::Verdict {
+        verdict: gates::VerdictKind::Fail,
+        severity: None,
+        summary: Some("The validation commands failed. See the test results below.".to_string()),
+        issues: Vec::new(),
+    }
+}
+
+/// Spend a repair attempt on making validation pass, or report the cycle's budget empty.
+///
+/// Repairs are counted apart from iterations because the failures differ in kind: a build that
+/// does not compile is mechanical and an exit code catches it, while an iteration is a review
+/// rejection paid for with a premium model. When both drew on one budget, three failed builds
+/// could end a run before the reviewer had seen the code at all.
+fn next_repair_phase(state: &mut RunState) -> Option<Phase> {
+    if state.remaining_repairs() == 0 {
+        return None;
+    }
+    state.repairs += 1;
+    state.fix_cause = Some(FixCause::Validation);
+    Some(Phase::Fixing)
+}
+
+/// Spend an iteration on a review rejection, or report that none remain.
+fn next_fix_phase(state: &mut RunState) -> Option<Phase> {
     if state.remaining_iterations() == 0 {
         return None;
     }
     state.iteration += 1;
+    // A rejection opens a fresh cycle, and the fix implementing its findings has the same right
+    // to a compiling result as the first attempt did — so the repair budget refills.
+    state.repairs = 0;
+    state.fix_cause = Some(FixCause::Review);
     Some(Phase::Fixing)
 }
 
@@ -812,12 +874,52 @@ mod tests {
     fn fix_attempts_are_spent_until_the_budget_runs_out() {
         let mut state = state(2);
 
-        assert_eq!(next_fix_phase(&mut state, "x"), Some(Phase::Fixing));
+        assert_eq!(next_fix_phase(&mut state), Some(Phase::Fixing));
         assert_eq!(state.iteration, 1);
-        assert_eq!(next_fix_phase(&mut state, "x"), Some(Phase::Fixing));
+        assert_eq!(next_fix_phase(&mut state), Some(Phase::Fixing));
         assert_eq!(state.iteration, 2);
-        assert_eq!(next_fix_phase(&mut state, "x"), None, "budget exhausted");
+        assert_eq!(next_fix_phase(&mut state), None, "budget exhausted");
         assert_eq!(state.iteration, 2, "a refused attempt must not be counted");
+    }
+
+    #[test]
+    fn a_broken_build_spends_the_repair_budget_and_not_the_review_budget() {
+        // The gap this closes: a build that would not compile and a review that found real
+        // problems used to draw on one budget, so three failed builds could end the run before
+        // the reviewer had seen the code at all.
+        let mut state = state(3);
+        state.max_repairs = 2;
+
+        assert_eq!(next_repair_phase(&mut state), Some(Phase::Fixing));
+        assert_eq!(next_repair_phase(&mut state), Some(Phase::Fixing));
+        assert_eq!(state.repairs, 2);
+        assert_eq!(state.fix_cause, Some(FixCause::Validation));
+        assert_eq!(
+            state.iteration, 0,
+            "a mechanical failure must never eat a review cycle"
+        );
+        assert_eq!(
+            next_repair_phase(&mut state),
+            None,
+            "cycle budget exhausted"
+        );
+        assert_eq!(state.repairs, 2, "a refused repair must not be counted");
+    }
+
+    #[test]
+    fn a_review_rejection_opens_a_fresh_cycle_with_a_full_repair_budget() {
+        // Each review's findings are a fresh implementation job with the same right to a
+        // compiling result, so the repair budget refills when an iteration is spent.
+        let mut state = state(3);
+        state.max_repairs = 2;
+        assert_eq!(next_repair_phase(&mut state), Some(Phase::Fixing));
+        assert_eq!(state.repairs, 1);
+
+        assert_eq!(next_fix_phase(&mut state), Some(Phase::Fixing));
+
+        assert_eq!(state.iteration, 1);
+        assert_eq!(state.fix_cause, Some(FixCause::Review));
+        assert_eq!(state.repairs, 0, "the new cycle starts with a full budget");
     }
 
     #[test]
@@ -863,8 +965,10 @@ mod tests {
     #[test]
     fn zero_iterations_means_one_shot_with_no_fixes() {
         let mut state = state(0);
+        state.max_repairs = 0;
 
-        assert_eq!(next_fix_phase(&mut state, "x"), None);
+        assert_eq!(next_fix_phase(&mut state), None);
+        assert_eq!(next_repair_phase(&mut state), None);
     }
 
     #[test]

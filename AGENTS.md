@@ -78,6 +78,14 @@ diff, or the reviewer is shown its own artifacts as the executor's work.
 **Failing validation skips review.** Asking a premium reviewer to judge code that does not build
 spends real money to learn what an exit code already proved.
 
+**A broken build and a review finding spend different budgets.** `loop.max_iterations` counts
+review rejections — judgment, paid for with a premium model. `loop.max_repairs` counts attempts to
+make validation pass — mechanical, caught by an exit code — and refills each time a rejection opens
+a new fix cycle, because each review's findings are a fresh implementation job with the same right
+to a compiling result. When both drew on one budget, three failed builds could end a run before the
+reviewer had seen the code at all. The cause also frames the fixer's prompt: a build no reviewer
+saw is never described as "reviewed and rejected".
+
 **The executor's account is enforced like the plan.** A phase that produces `EXECUTION.md` may not
 end without one. When it is missing the executor is asked once more for just the summary — the
 implementation is already on disk and is the expensive artifact, while the account is prose that can
@@ -206,9 +214,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **`max_iterations` mixes two kinds of failure.** A build that will not compile and a review that
-  found real problems spend the same budget, so three failed builds can exhaust the run before the
-  reviewer has seen the code at all.
 - **Cross-repo tasks do not work.** Agents are sandboxed to the worktree, and the prompts tell them
   to work only inside it. Use `--no-isolate` or copy the material in.
 - **Task sizing has no rule.** A three-part task overran an executor budget that had been generous

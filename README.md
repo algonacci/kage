@@ -90,7 +90,11 @@ roles:
     adapter: codex
 
 loop:
+  # How many times the reviewer may reject the work.
   max_iterations: 3
+  # Attempts to make validation pass before each review. A broken build spends
+  # these, never a review cycle — the two failures are different in kind.
+  max_repairs: 3
 
 git:
   isolate: true

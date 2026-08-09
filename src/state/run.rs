@@ -61,6 +61,20 @@ pub struct Event {
     pub message: String,
 }
 
+/// What sent the run into the FIX phase.
+///
+/// Recorded because the two causes spend different budgets and brief the fixer differently: a
+/// validation failure is mechanical and must not re-present the previous review's findings as if
+/// they were the reason — those were already addressed, and the exit code is the whole story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixCause {
+    /// The validation commands failed: caught by an exit code, charged to the repair budget.
+    Validation,
+    /// The reviewer rejected the work: a premium judgment, charged to the iteration budget.
+    Review,
+}
+
 /// Isolation details, recorded so `kage status` can tell the user where the code actually landed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Worktree {
@@ -136,9 +150,27 @@ pub struct RunState {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub phase: Phase,
-    /// Completed fix attempts. Starts at 0; the first review failure pushes it to 1.
+    /// Completed review-rejection fix attempts. Starts at 0; the first review failure pushes it
+    /// to 1. Validation failures never touch this — they spend `repairs`.
     pub iteration: usize,
     pub max_iterations: usize,
+    /// Repair attempts spent making validation pass in the current fix cycle.
+    ///
+    /// Reset when a review rejection opens a new cycle: each review's findings are a fresh
+    /// implementation job with the same right to a compiling result. Kept apart from `iteration`
+    /// because a broken build and a review finding are different failures — sharing one budget let
+    /// three failed builds end a run before the reviewer had seen the code at all.
+    #[serde(default)]
+    pub repairs: usize,
+    /// Absent from state files written before the split budget; those runs resume with the
+    /// documented default rather than a repair budget of zero, which would fail them on their
+    /// first broken build.
+    #[serde(default = "default_max_repairs")]
+    pub max_repairs: usize,
+    /// Why the run is in `Fixing`, when it is. Absent on state files that predate the split
+    /// budget; the workflow then falls back to inferring the cause from whether a verdict exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_cause: Option<FixCause>,
     /// Whether the run started at EXECUTE with the task itself as the executor's instruction.
     ///
     /// Recorded rather than inferred from a missing `PLAN.md`: a plan that was written and then
@@ -176,6 +208,12 @@ pub struct RunState {
     pub history: Vec<Event>,
 }
 
+/// The repair budget a state file gets when it predates the field, and `new` starts from before
+/// `start` copies the config's value in.
+fn default_max_repairs() -> usize {
+    3
+}
+
 impl RunState {
     pub fn new(id: String, task: String, workdir: PathBuf, max_iterations: usize) -> Self {
         let now = Utc::now();
@@ -187,6 +225,9 @@ impl RunState {
             phase: Phase::Created,
             iteration: 0,
             max_iterations,
+            repairs: 0,
+            max_repairs: default_max_repairs(),
+            fix_cause: None,
             skip_plan: false,
             workdir,
             worktree: None,
@@ -210,9 +251,14 @@ impl RunState {
         });
     }
 
-    /// Fix attempts still available before the loop gives up.
+    /// Review-rejection fix attempts still available before the loop gives up.
     pub fn remaining_iterations(&self) -> usize {
         self.max_iterations.saturating_sub(self.iteration)
+    }
+
+    /// Repair attempts still available in the current fix cycle.
+    pub fn remaining_repairs(&self) -> usize {
+        self.max_repairs.saturating_sub(self.repairs)
     }
 }
 
@@ -293,6 +339,30 @@ mod tests {
         let state: RunState = serde_json::from_str(json).unwrap();
 
         assert!(!state.skip_plan, "a predating state file must still plan");
+    }
+
+    #[test]
+    fn a_state_file_written_before_the_split_budget_still_loads_with_repairs_to_spend() {
+        // A mid-flight run saved before `repairs`/`max_repairs` existed must resume with the
+        // documented default budget, not zero — zero would fail it on its first broken build,
+        // which is a harsher rule than the one it started under.
+        let json = r#"{ "id": "run_1",
+            "task": "add caching",
+            "created_at": "2026-08-09T00:00:00Z",
+            "updated_at": "2026-08-09T00:00:00Z",
+            "phase": "fixing",
+            "iteration": 1,
+            "max_iterations": 3,
+            "workdir": "." }"#;
+
+        let state: RunState = serde_json::from_str(json).unwrap();
+
+        assert_eq!(state.repairs, 0);
+        assert_eq!(state.max_repairs, 3);
+        assert!(
+            state.fix_cause.is_none(),
+            "an old run's cause is unknown and must be inferred, not invented"
+        );
     }
 
     #[test]

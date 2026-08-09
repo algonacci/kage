@@ -52,9 +52,16 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
     }
     println!("Phase:   {}", state.phase);
     println!(
-        "Fixes:   {} of {} used",
+        "Fixes:   {} of {} review fix(es) used",
         state.iteration, state.max_iterations
     );
+    // Repairs are per-cycle bookkeeping; a zero says nothing worth a line.
+    if state.repairs > 0 {
+        println!(
+            "Repairs: {} of {} used this cycle making validation pass",
+            state.repairs, state.max_repairs
+        );
+    }
     println!(
         "Started: {}",
         state.created_at.format("%Y-%m-%d %H:%M:%S UTC")

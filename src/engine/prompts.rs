@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::engine::gates::Verdict;
-use crate::state::Artifacts;
+use crate::state::{Artifacts, FixCause};
 
 /// Rules that apply to every role, restated per prompt because the agents share no history.
 fn preamble(role: &str, workdir: &Path) -> String {
@@ -242,17 +242,33 @@ pub fn account(
     )
 }
 
+/// Which budget a fix spends and where it stands, for the fixer's own framing.
+///
+/// One value rather than three loose parameters, because the three only make sense together: an
+/// attempt number is meaningless without the budget it counts against, and both are meaningless
+/// without knowing which failure they are counting.
+#[derive(Debug, Clone, Copy)]
+pub struct FixAttempt {
+    pub cause: FixCause,
+    pub attempt: usize,
+    pub budget: usize,
+}
+
 /// Ask the executor to repair specific findings.
 ///
 /// The fix prompt names the findings rather than restating the whole task, because a rewrite is a
 /// new chance to break what already passed. Narrow instructions produce narrow diffs.
+///
+/// The cause changes the framing, not the structure. Telling an executor its work "was reviewed
+/// and rejected" when no reviewer ever saw it invents an authority the loop does not have — and an
+/// agent told to fix review findings hunts for findings, while one told the build broke reads the
+/// test output.
 pub fn fixer(
     workdir: &Path,
     artifacts: &Artifacts,
     brief: Brief<'_>,
     verdict: &Verdict,
-    iteration: usize,
-    max_iterations: usize,
+    fix: FixAttempt,
     delivery: Delivery,
 ) -> String {
     let brief_block = match brief {
@@ -268,12 +284,36 @@ pub fn fixer(
         ),
     };
 
+    let FixAttempt {
+        cause,
+        attempt,
+        budget,
+    } = fix;
+    let (intro, findings_header, deliverable_note) = match cause {
+        FixCause::Review => (
+            format!(
+                "Your previous implementation was reviewed and rejected. Fix the findings \
+                 below.\n\nThis is fix attempt {attempt} of {budget}."
+            ),
+            "## Review findings",
+            "In your deliverable, record what you changed for each finding, by id.",
+        ),
+        FixCause::Validation => (
+            format!(
+                "Your implementation does not pass the project's validation commands. Repair \
+                 that and nothing else.\n\nThis is repair attempt {attempt} of {budget} in this \
+                 cycle."
+            ),
+            "## What failed",
+            "In your deliverable, record what was broken and what you changed to repair it.",
+        ),
+    };
+
     format!(
         "{}\
-         Your previous implementation was reviewed and rejected. Fix the findings below.\n\n\
-         This is fix attempt {iteration} of {max_iterations}.\n\n\
+         {intro}\n\n\
          {}\
-         ## Review findings\n\n{}\n\n\
+         {findings_header}\n\n{}\n\n\
          ## Test results from the last run\n\n{}\n\n\
          {}\
          ## Rules\n\n\
@@ -281,7 +321,7 @@ pub fn fixer(
          - Do not weaken, skip, or delete a test to make it pass. If a test is genuinely wrong, \
            say so explicitly in your deliverable and explain why.\n\
          - Re-run the tests before you finish.\n\n\
-         In your deliverable, record what you changed for each finding, by id.\n",
+         {deliverable_note}\n",
         preamble("executor", workdir),
         deliverable(
             delivery,
@@ -511,8 +551,11 @@ mod tests {
             &artifacts,
             Brief::Plan,
             &verdict,
-            2,
-            3,
+            FixAttempt {
+                cause: FixCause::Review,
+                attempt: 2,
+                budget: 3,
+            },
             Delivery::AgentWrites,
         );
 
@@ -520,6 +563,46 @@ mod tests {
         assert!(prompt.contains("race on the counter"));
         assert!(prompt.contains("fix attempt 2 of 3"));
         assert!(prompt.contains("Do not weaken, skip, or delete a test"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_validation_repair_is_never_told_it_was_reviewed() {
+        // Before the budgets were split, every fix prompt opened with "your implementation was
+        // reviewed and rejected" — including fixes for builds no reviewer had seen. An agent told
+        // to fix review findings hunts for findings; one told the build broke reads test output.
+        let (root, artifacts) = artifacts("repair");
+        let verdict = gates::Verdict {
+            verdict: gates::VerdictKind::Fail,
+            severity: None,
+            summary: Some("The validation commands failed.".to_string()),
+            issues: Vec::new(),
+        };
+
+        let prompt = fixer(
+            &root,
+            &artifacts,
+            Brief::Plan,
+            &verdict,
+            FixAttempt {
+                cause: FixCause::Validation,
+                attempt: 1,
+                budget: 3,
+            },
+            Delivery::AgentWrites,
+        );
+
+        assert!(prompt.contains("validation commands"));
+        assert!(prompt.contains("repair attempt 1 of 3"));
+        assert!(
+            !prompt.contains("reviewed and rejected"),
+            "no reviewer saw this build, and the prompt must not invent one:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("## Review findings"),
+            "there are no review findings to present:\n{prompt}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -539,8 +622,11 @@ mod tests {
                 task: "add a health check endpoint",
             },
             &verdict,
-            1,
-            3,
+            FixAttempt {
+                cause: FixCause::Review,
+                attempt: 1,
+                budget: 3,
+            },
             Delivery::AgentWrites,
         );
 
@@ -764,6 +850,11 @@ mod tests {
                 Delivery::AgentWrites,
             ),
         );
+        let review_fix = FixAttempt {
+            cause: FixCause::Review,
+            attempt: 1,
+            budget: 3,
+        };
         dump(
             "fixer-plan",
             fixer(
@@ -771,8 +862,7 @@ mod tests {
                 &artifacts,
                 Brief::Plan,
                 &verdict,
-                1,
-                3,
+                review_fix,
                 Delivery::AgentWrites,
             ),
         );
@@ -783,8 +873,22 @@ mod tests {
                 &artifacts,
                 Brief::Request { task: "TASK {x}" },
                 &verdict,
-                1,
-                3,
+                review_fix,
+                Delivery::AgentWrites,
+            ),
+        );
+        dump(
+            "fixer-repair",
+            fixer(
+                &root,
+                &artifacts,
+                Brief::Plan,
+                &verdict,
+                FixAttempt {
+                    cause: FixCause::Validation,
+                    attempt: 1,
+                    budget: 3,
+                },
                 Delivery::AgentWrites,
             ),
         );

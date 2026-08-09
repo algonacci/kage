@@ -182,8 +182,11 @@ fn starter_config(root: &Path) -> String {
          #     command: [\"my-agent\", \"--yolo\", \"{{prompt}}\"]\n\
          \n\
          loop:\n\
-         \x20 # Fix attempts allowed after the first failing review.\n\
+         \x20 # How many times the reviewer may reject the work.\n\
          \x20 max_iterations: 3\n\
+         \x20 # Attempts to make validation pass before each review; a broken build\n\
+         \x20 # spends these, never a review cycle.\n\
+         \x20 max_repairs: 3\n\
          \n\
          git:\n\
          \x20 # Run agents in a throwaway worktree instead of your working tree.\n\
