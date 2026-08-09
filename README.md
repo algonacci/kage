@@ -242,6 +242,14 @@ RTK is optional; commands containing shell operators and systems without RTK run
 Kage v0.1 is one planner, one executor, one reviewer. No DAGs, no parallel agents, no dynamic
 delegation — none of that is worth building before this line is reliable end to end.
 
+One run works one repository. Everything Kage guarantees — isolation, the diff the reviewer
+judges, the commit that survives the run — is defined against a single worktree, so a task that
+reaches into another repository would produce work no reviewer sees. If a task needs material from
+elsewhere, copy it into the repository first (it is then versioned with the run); if you truly
+mean to edit another tree, run there, or accept `--no-isolate` and what it trades away.
+Multi-repository work belongs to the graph-engineering versions, where each repository gets its
+own agent.
+
 Kage is an engineering workflow orchestrator, not a general assistant. Personal memory, email,
 calendar, and chat belong in [Kamui](https://github.com/algonacci/kamui) and
 [Kumo](https://github.com/algonacci/kumo). Kage is fully usable without either.

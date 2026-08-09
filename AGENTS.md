@@ -96,6 +96,16 @@ predicate (`Artifacts::has_content`) so a blank file cannot pass one and trip th
 **A review with no machine-readable verdict blocks the run.** Guessing PASS lets unreviewed code
 through; guessing FAIL burns an iteration on nothing.
 
+**One run works one repository; cross-repo tasks are a boundary, not a gap.** Decided, not
+deferred: every guarantee Kage makes — isolation, the diff against the base commit, the review's
+scope, commit-on-finish, what `kage clean` may safely remove — is defined per worktree. A second
+repository has no base commit, no run branch, and no place in the diff the reviewer judges, so
+work done there would be unreviewed by construction: exactly what the gates exist to prevent.
+Supporting it means one agent per repository with explicit dependencies, which is graph
+engineering (v1.x), not a patch on this loop. Until then the two sanctioned routes stand: copy
+the material into the repository (a read need — and the material the executor saw is then
+versioned with the run), or `--no-isolate` when the user knowingly trades away isolation.
+
 **Task sizing is the planner's call, declared before the executor spends anything.** A three-part
 task once overran an executor budget that had been generous for everything before it, and the user
 learned only after the hour was gone. A string heuristic cannot judge task size, but the planner —
@@ -232,8 +242,6 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **Cross-repo tasks do not work.** Agents are sandboxed to the worktree, and the prompts tell them
-  to work only inside it. Use `--no-isolate` or copy the material in.
 - **A phase that keeps talking while going nowhere still costs its full budget.** Silence is now
   acted on (see the stall decision above), but a harness looping noisily is mechanically
   indistinguishable from one working — telling them apart needs judgment about the output, not a
