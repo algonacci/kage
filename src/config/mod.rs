@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-pub use schema::{AdapterKind, Config, PromptDelivery, Provider, RoleConfig, Roles, Validation};
+pub use schema::{
+    AdapterKind, Config, PromptDelivery, Provider, RoleConfig, Roles, Setup, Validation,
+};
 
 /// Directory name that marks a Kage project, mirroring `.git`.
 pub const KAGE_DIR: &str = ".kage";

@@ -28,6 +28,9 @@ pub struct Config {
     pub loop_config: LoopConfig,
     #[serde(default)]
     pub git: GitConfig,
+    /// Commands that prepare a freshly created worktree before any phase runs.
+    #[serde(default)]
+    pub setup: Setup,
     #[serde(default)]
     pub validation: Validation,
 }
@@ -410,6 +413,29 @@ pub struct Validation {
 }
 
 fn default_validation_timeout() -> u64 {
+    900
+}
+
+/// Commands that make a freshly created worktree usable.
+///
+/// A worktree is a clean checkout of tracked files, and every language that keeps its dependencies
+/// outside the repository arrives there with none: `node_modules` is gitignored, so `npm test` in a
+/// new worktree fails for reasons that have nothing to do with the change under test. Cargo hides
+/// this by sharing a global registry cache, which is why the gap stayed invisible until Kage was
+/// pointed at its first JavaScript project.
+///
+/// These run once, after the worktree is created and before the first phase, and a failure aborts
+/// the run before an agent is spawned — a gate that cannot run is not a gate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Setup {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default = "default_setup_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_setup_timeout() -> u64 {
     900
 }
 

@@ -3,7 +3,7 @@
 pub mod doctor;
 pub mod status;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -25,6 +25,31 @@ pub fn init(cwd: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The task text, from wherever the user chose to put it.
+///
+/// A brief worth writing down is a brief the shell will mangle: a newline ends the argument and
+/// Windows caps a command line near 32k characters, so a long task arrives silently truncated and
+/// the run plans whatever survived. `--task-file` is the way out, and one of the two must be given.
+pub fn resolve_task(task: Option<String>, task_file: Option<PathBuf>) -> Result<String> {
+    match (task, task_file) {
+        (Some(task), _) => Ok(task),
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("cannot read the task file at {}", path.display()))?;
+
+            if text.trim().is_empty() {
+                bail!("{} is empty", path.display());
+            }
+            Ok(text)
+        }
+        (None, None) => bail!(
+            "give a task, either on the command line or with --task-file\n\
+             a brief longer than a sentence belongs in a file: the shell truncates at the first \
+             newline and does it silently"
+        ),
+    }
+}
+
 /// `kage run "<task>"` — plan, execute, test, review, fix, verify.
 pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
     if task.trim().is_empty() {
@@ -34,7 +59,15 @@ pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
     let project = Project::discover(cwd)?;
     let config = project.load_config()?;
 
-    println!("Task: {task}");
+    // A long brief is quoted rather than echoed: the terminal is not where it is read, and the
+    // run's REQUEST.md holds it verbatim either way.
+    match task.lines().count() {
+        1 => println!("Task: {task}"),
+        lines => println!(
+            "Task: {} … ({lines} lines)",
+            task.lines().next().unwrap_or_default().trim()
+        ),
+    }
 
     let state = workflow::start(&project, &config, task, &options).await?;
     report(&state);

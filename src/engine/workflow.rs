@@ -26,6 +26,11 @@ pub struct Options {
     pub no_isolate: bool,
     /// Start at EXECUTE with the task as the executor's instruction, with no planning phase.
     pub skip_plan: bool,
+    /// Do not run the validation commands once before the first phase.
+    ///
+    /// The check costs a full test run at startup, which is worth paying to learn the gate is
+    /// broken — but not on a suite slow enough that the answer arrives later than the problem.
+    pub skip_gate_check: bool,
 }
 
 /// How a run with no planning phase is described, wherever it is described.
@@ -126,6 +131,11 @@ pub async fn start(
         state.base_commit = Some(git::head_commit(&state.workdir).await?);
     }
 
+    // Before any phase: a worktree that cannot run the project's own commands cannot be judged by
+    // them, and every phase after this point would be measuring the environment instead of the work.
+    runner::prepare(&state.workdir, &config.setup).await?;
+    state.gate_was_red = baseline_gate(&state.workdir, config, options).await?;
+
     // Only now is the working directory known, and with it where artifacts have to live.
     let artifacts = Artifacts::for_run(project, &run_id, &state.workdir);
     artifacts.ensure_dirs()?;
@@ -140,6 +150,60 @@ pub async fn start(
 
     store::save(project, &state)?;
     drive(project, config, state).await
+}
+
+/// Check the acceptance gate before the run depends on it, and report whether it was already red.
+///
+/// The gate decides whether the executor's work is accepted, so a gate that was failing before the
+/// run started cannot do that job: the first TEST phase fails on faults the executor did not cause,
+/// and the repair budget is spent on them. That happened the first time Kage was pointed at a
+/// project it had not built — three pre-existing lint errors would have consumed the whole run.
+///
+/// It is a warning rather than a refusal because "make the failing tests pass" is a legitimate
+/// task, and refusing it would forbid the one job most worth handing to this loop. What must not
+/// happen is the failure being *silent*: the reviewer is told which commands were already failing,
+/// so it does not attribute them to the change it is judging.
+async fn baseline_gate(
+    workdir: &std::path::Path,
+    config: &Config,
+    options: &Options,
+) -> Result<bool> {
+    if config.validation.commands.is_empty() || options.skip_gate_check {
+        return Ok(false);
+    }
+
+    println!("\n  checking the gate before spending anything");
+    let report = runner::validate(workdir, &config.validation).await?;
+
+    if report.passed() {
+        return Ok(false);
+    }
+
+    let failing: Vec<&str> = report.failed().map(|r| r.command.as_str()).collect();
+    println!(
+        "\n  ! the gate is already failing before any work: {}\n  \
+         the run continues — this is what a \"fix the failing build\" task looks like — but the \n  \
+         reviewer will be told these failures predate the change.",
+        failing.join(", ")
+    );
+
+    Ok(true)
+}
+
+/// What `TEST_RESULTS.md` says before its own contents, when the gate was already red.
+///
+/// The reviewer is told to judge the change against the test results, so without this it charges
+/// the executor for failures that were there before the run began — and the fixer is sent after
+/// them with the same misunderstanding.
+fn baseline_note(state: &RunState) -> String {
+    if !state.gate_was_red {
+        return String::new();
+    }
+
+    "> **The validation gate was already failing before this run started.** Some of what follows \
+     may predate the change under review. Judge the change on what it did, and treat a failure it \
+     did not introduce as pre-existing unless the task was to fix it.\n\n"
+        .to_string()
 }
 
 /// Continue an interrupted run from wherever its state file says it stopped.
@@ -366,8 +430,11 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
             Phase::Testing => {
                 banner(&state, "TEST", "validation commands");
                 let report = runner::validate(&state.workdir, &config.validation).await?;
-                std::fs::write(artifacts.test_results(), report.to_markdown())
-                    .context("cannot write TEST_RESULTS.md")?;
+                std::fs::write(
+                    artifacts.test_results(),
+                    format!("{}{}", baseline_note(&state), report.to_markdown()),
+                )
+                .context("cannot write TEST_RESULTS.md")?;
 
                 if report.passed() {
                     state.transition(Phase::Reviewing, "validation passed");
@@ -931,6 +998,25 @@ mod tests {
             PathBuf::from("."),
             max_iterations,
         )
+    }
+
+    #[test]
+    fn a_red_baseline_warns_the_reviewer_inside_the_test_results() {
+        // Without this the reviewer charges the executor for failures that predate the run, and the
+        // fixer is sent after them with the same misunderstanding. The first time Kage was pointed
+        // at a project it had not built, three pre-existing lint errors were waiting.
+        let mut state = state(3);
+        state.gate_was_red = true;
+
+        let note = baseline_note(&state);
+
+        assert!(note.contains("already failing before this run started"));
+        assert!(note.contains("pre-existing"));
+    }
+
+    #[test]
+    fn a_green_baseline_adds_nothing_to_the_test_results() {
+        assert_eq!(baseline_note(&state(3)), "");
     }
 
     #[test]

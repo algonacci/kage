@@ -45,8 +45,16 @@ enum Command {
 
     /// Run the full workflow on a task
     Run {
-        /// What you want built, in plain language
-        task: String,
+        /// What you want built, in plain language. Omit when passing --task-file.
+        task: Option<String>,
+
+        /// Read the task from a file instead of the command line
+        ///
+        /// A brief long enough to be worth writing down is a brief the shell will mangle: a
+        /// newline ends the argument, and Windows caps a command line near 32k characters. Both
+        /// failures are silent — the run starts, and plans whatever survived.
+        #[arg(long, value_name = "PATH", conflicts_with = "task")]
+        task_file: Option<std::path::PathBuf>,
 
         /// Fix attempts allowed after a failing review (overrides the config)
         #[arg(long)]
@@ -59,6 +67,10 @@ enum Command {
         /// Skip planning: start at EXECUTE with the task as the executor's instruction
         #[arg(long)]
         skip_plan: bool,
+
+        /// Do not run the validation commands once before the first phase
+        #[arg(long)]
+        skip_gate_check: bool,
     },
 
     /// Show a run's state, artifacts, and history
@@ -98,10 +110,13 @@ async fn main() -> Result<()> {
 
         Command::Run {
             task,
+            task_file,
             max_iterations,
             no_isolate,
             skip_plan,
+            skip_gate_check,
         } => {
+            let task = cli::resolve_task(task, task_file)?;
             cli::run(
                 &cwd,
                 &task,
@@ -109,6 +124,7 @@ async fn main() -> Result<()> {
                     max_iterations,
                     no_isolate,
                     skip_plan,
+                    skip_gate_check,
                 },
             )
             .await
@@ -140,7 +156,9 @@ mod tests {
             .expect("a quoted task is a single positional argument");
 
         match args.command {
-            Command::Run { task, .. } => assert_eq!(task, "Implement rate limiting for the API"),
+            Command::Run { task, .. } => {
+                assert_eq!(task.as_deref(), Some("Implement rate limiting for the API"));
+            }
             _ => panic!("expected the run command"),
         }
     }
@@ -180,6 +198,66 @@ mod tests {
             Command::Run { skip_plan, .. } => assert!(skip_plan),
             _ => panic!("expected the run command"),
         }
+    }
+
+    #[test]
+    fn a_task_can_come_from_a_file_instead_of_argv() {
+        let args = Cli::try_parse_from(["kage", "run", "--task-file", "PROMPT.md"])
+            .expect("no positional");
+
+        match args.command {
+            Command::Run {
+                task, task_file, ..
+            } => {
+                assert!(task.is_none());
+                assert_eq!(task_file.unwrap().to_string_lossy(), "PROMPT.md");
+            }
+            _ => panic!("expected the run command"),
+        }
+    }
+
+    #[test]
+    fn a_task_and_a_task_file_cannot_both_be_given() {
+        // Silently preferring one would hide which brief the run actually used.
+        assert!(
+            Cli::try_parse_from(["kage", "run", "inline", "--task-file", "PROMPT.md"]).is_err()
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_task_at_all_is_refused_with_the_way_out() {
+        let error = crate::cli::resolve_task(None, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("--task-file"), "{error}");
+        assert!(
+            error.contains("truncates"),
+            "the silent failure must be named"
+        );
+    }
+
+    #[test]
+    fn a_task_file_is_read_whole() {
+        // The bug this guards: a 1838-line brief passed through argv arrived as its first line,
+        // and the run planned a title.
+        let path = std::env::temp_dir().join(format!("kage-task-{}.md", std::process::id()));
+        std::fs::write(
+            &path,
+            "# Brief
+
+line two
+line three
+",
+        )
+        .unwrap();
+
+        let task = crate::cli::resolve_task(None, Some(path.clone())).unwrap();
+
+        assert_eq!(task.lines().count(), 4);
+        assert!(task.contains("line three"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

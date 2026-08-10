@@ -58,6 +58,16 @@ Before the first phase, `kage run` and `kage resume` resolve the program behind 
 will actually spawn and abort with the same report `kage doctor` gives if one is unreachable — so a
 run cannot spend a planner and an executor before discovering the reviewer was never installed.
 
+### A brief too long for the command line
+
+```bash
+kage run --task-file BRIEF.md
+```
+
+A newline ends a shell argument and Windows caps a command line near 32k characters, so a brief
+worth writing down is a brief the shell will truncate — silently, leaving the run to plan whatever
+survived. Give it a file instead.
+
 ### Task sizing
 
 One run, one task. Give the executor about an hour's worth of work and split anything larger —
@@ -171,6 +181,35 @@ not model.
 > `C:\Users\...` as an escape sequence and fails to parse.
 
 Kage owns none of these tools' credentials. Authentication stays each harness's business.
+
+### Preparing a worktree
+
+A worktree is a clean checkout of tracked files, so a project that keeps its dependencies outside
+the repository arrives with none of them:
+
+```yaml
+setup:
+  commands:
+    - npm ci
+  timeout_secs: 900
+```
+
+These run once, after the worktree is created and before the first phase. A failure aborts the run
+before an agent is spawned, because a gate that cannot run is not a gate — without this, `npm test`
+fails on every phase of every run for reasons that have nothing to do with the change. Cargo hides
+the problem by sharing a global registry cache, which is why it is easy to forget.
+
+### The gate is checked before the run depends on it
+
+Before the first phase, `kage run` runs the validation commands once. A gate that was already
+failing cannot judge the executor's work: the first TEST phase fails on faults the change did not
+cause, and the repair budget is spent on them.
+
+This warns rather than refuses, because "make the failing tests pass" is a legitimate task and
+refusing it would forbid the job most worth handing to this loop. What it will not do is let the
+failure be silent: `TEST_RESULTS.md` tells the reviewer which failures predate the change, so they
+are not charged to it. Pass `--skip-gate-check` on a suite slow enough that the answer would arrive
+later than the problem.
 
 ## How it works
 

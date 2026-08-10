@@ -160,6 +160,16 @@ skipping the plan must not mean skipping the gate. The executor and reviewer pro
 is no plan rather than handed an empty one — "PLAN.md is missing" reads to an agent as a fault to
 report, and to a reviewer as an invitation to return BLOCKED.
 
+**A worktree must be prepared before it can be judged.** `setup.commands` runs once after the
+worktree is created. A clean checkout has no `node_modules`, so a JavaScript project's gate fails on
+every phase for reasons the change did not cause. Cargo's shared registry cache hid this until Kage
+was first pointed at a project it had not built.
+
+**The gate is checked green before the run depends on it, and warns rather than refuses.** A red
+gate cannot judge the work. But "fix the failing build" is a legitimate task, so the check records
+the baseline in `TEST_RESULTS.md` instead of blocking — the failure must not be silent, and it must
+not be charged to the change.
+
 ## Harness facts
 
 Invocations verified against each tool's own `--help`, not guessed. They are the piece most likely
@@ -242,6 +252,9 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
+- **A worktree prepared once is not prepared again.** `setup.commands` runs at `kage run`, not at
+  `kage resume` — a resumed run whose worktree was rebuilt by `kage clean` starts with an empty
+  `node_modules` and no setup to fill it.
 - **A phase that keeps talking while going nowhere still costs its full budget.** Silence is now
   acted on (see the stall decision above), but a harness looping noisily is mechanically
   indistinguishable from one working — telling them apart needs judgment about the output, not a

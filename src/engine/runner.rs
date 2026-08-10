@@ -7,10 +7,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::adapters::proc;
-use crate::config::Validation;
+use crate::config::{Setup, Validation};
 
 /// The result of one validation command.
 #[derive(Debug, Clone)]
@@ -80,6 +80,45 @@ impl TestReport {
 
         out
     }
+}
+
+/// Prepare a freshly created worktree so its validation gate can run at all.
+///
+/// A worktree holds only tracked files, so a project that keeps its dependencies outside the
+/// repository arrives with none of them. `npm test` there fails for reasons that have nothing to do
+/// with the change under test, and it would fail that way on every phase, spending the repair
+/// budget on an empty `node_modules`.
+///
+/// Failure aborts the run before any agent is spawned: preparation that did not work leaves a gate
+/// that cannot judge anything, and every phase after it would be measuring the environment.
+pub async fn prepare(workdir: &Path, setup: &Setup) -> Result<()> {
+    if setup.commands.is_empty() {
+        return Ok(());
+    }
+
+    let timeout = Duration::from_secs(setup.timeout_secs);
+
+    for command in &setup.commands {
+        println!("  setup $ {command}");
+
+        let mut spawn = proc::shell_spawn(command, workdir.to_path_buf(), timeout);
+        spawn.heartbeat = Some(proc::HEARTBEAT_INTERVAL);
+        let outcome = proc::run(spawn).await?;
+
+        println!("    {}", outcome.describe());
+
+        if !outcome.success() {
+            bail!(
+                "the setup command `{command}` failed ({})\n{}\n\
+                 the worktree is not usable, so nothing was spawned — fix the command in \
+                 `setup.commands` or run it by hand in the project first",
+                outcome.describe(),
+                tail(outcome.failure_output().trim(), 20)
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Run every configured validation command in order, stopping at the first failure.
@@ -164,6 +203,44 @@ mod tests {
             commands: commands.iter().map(|c| c.to_string()).collect(),
             timeout_secs: 60,
         }
+    }
+
+    fn setup(commands: &[&str]) -> Setup {
+        Setup {
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+            timeout_secs: 60,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_project_with_no_setup_needs_none() {
+        assert!(prepare(&std::env::temp_dir(), &setup(&[])).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn setup_commands_run_in_order_and_a_failure_stops_the_run() {
+        // The bug this guards: a worktree is a clean checkout, so a JS project arrives with no
+        // node_modules and `npm test` fails on every phase for reasons the executor did not cause.
+        assert!(
+            prepare(
+                &std::env::temp_dir(),
+                &setup(&["echo first", "echo second"])
+            )
+            .await
+            .is_ok()
+        );
+
+        let error = prepare(&std::env::temp_dir(), &setup(&["exit 3", "echo never"]))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("exit 3"), "{error}");
+        assert!(
+            error.contains("nothing was spawned"),
+            "the message must say no agent was paid for: {error}"
+        );
+        assert!(error.contains("setup.commands"), "and name the way out");
     }
 
     #[tokio::test]

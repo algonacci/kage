@@ -178,6 +178,12 @@ pub struct RunState {
     /// `kage status` nor the closing summary may present one as the other.
     #[serde(default)]
     pub skip_plan: bool,
+    /// Whether the validation gate was already failing before this run touched anything.
+    ///
+    /// Recorded so the reviewer is not asked to judge a change against failures that predate it,
+    /// and so `kage status` can say why a run's first TEST phase failed on work it never did.
+    #[serde(default)]
+    pub gate_was_red: bool,
     /// Directory the agents actually run in — the worktree when isolating, else the project root.
     pub workdir: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -229,6 +235,7 @@ impl RunState {
             max_repairs: default_max_repairs(),
             fix_cause: None,
             skip_plan: false,
+            gate_was_red: false,
             workdir,
             worktree: None,
             base_commit: None,
