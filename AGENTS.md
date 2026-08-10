@@ -160,6 +160,13 @@ skipping the plan must not mean skipping the gate. The executor and reviewer pro
 is no plan rather than handed an empty one — "PLAN.md is missing" reads to an agent as a fault to
 report, and to a reviewer as an invitation to return BLOCKED.
 
+**A path handed to an agent must not repeat a segment of the route to it.** An isolated run's
+artifacts live at `.kage-run/` inside the worktree, not `.kage/runs/<id>/`. The worktree is already
+`<project>/.kage/worktrees/<id>/`, so the old shape produced a path with `.kage` twice and the run
+id twice; an executor normalised the repetition away, asked for a path outside its sandbox, was
+refused, and spent twenty minutes failing to write a file it had been given correctly. Kage is
+driven by imperfect agents by design, so an ambiguous path is a defect here, not a mistake there.
+
 **A worktree must be prepared before it can be judged.** `setup.commands` runs once after the
 worktree is created. A clean checkout has no `node_modules`, so a JavaScript project's gate fails on
 every phase for reasons the change did not cause. Cargo's shared registry cache hid this until Kage

@@ -230,6 +230,11 @@ that crashes can be resumed and inspected afterwards.
 └── logs/               what each agent printed, written live
 ```
 
+While a run is live its agents work against a copy at `.kage-run/` inside the worktree, mirrored
+back here after every phase. That directory shares no name with the path leading to the worktree:
+`.kage/worktrees/<id>/.kage/runs/<id>/` repeated two segments, and an agent collapsed the repetition
+into a path outside its own sandbox.
+
 Each agent's output is streamed to the terminal as it arrives — claude's events are rendered as
 short progress lines rather than JSON — and its log under `logs/` is written line by line, so
 `tail -f` (or `Get-Content -Wait`) shows what the agent is doing while the phase is still running.

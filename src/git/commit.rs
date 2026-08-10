@@ -29,13 +29,20 @@ pub async fn commit_work(
     subject: &str,
     body: &str,
 ) -> Result<Commitment> {
-    git::git(workdir, &["add", "--all", "--", ".", EXCLUDE_KAGE])
-        .await
-        .context("cannot stage the run's work")?;
+    git::git(
+        workdir,
+        &[&["add", "--all", "--", "."][..], EXCLUDE_KAGE].concat(),
+    )
+    .await
+    .context("cannot stage the run's work")?;
 
     let cached = git::git(
         workdir,
-        &["diff", "--cached", "--name-only", "--", ".", EXCLUDE_KAGE],
+        &[
+            &["diff", "--cached", "--name-only", "--", "."][..],
+            EXCLUDE_KAGE,
+        ]
+        .concat(),
     )
     .await
     .context("cannot list the staged work")?;
@@ -89,14 +96,10 @@ pub async fn commit_work(
     let changed = git::git(
         workdir,
         &[
-            "diff",
-            "--name-only",
-            base_commit,
-            &head,
-            "--",
-            ".",
+            &["diff", "--name-only", base_commit, &head, "--", "."][..],
             EXCLUDE_KAGE,
-        ],
+        ]
+        .concat(),
     )
     .await
     .context("cannot count the files on the branch")?;

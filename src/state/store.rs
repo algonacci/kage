@@ -111,6 +111,20 @@ impl Artifacts {
         }
     }
 
+    /// Where an isolated run's artifacts sit inside its worktree.
+    ///
+    /// Deliberately shares no path segment with the route to the worktree itself. The worktree
+    /// lives at `<project>/.kage/worktrees/<run_id>/`, so putting artifacts under `.kage/runs/
+    /// <run_id>/` inside it produced `…/.kage/worktrees/<id>/.kage/runs/<id>/EXECUTION.md` — a path
+    /// with `.kage` twice and the run id twice. An executor collapsed the repetition, asked for
+    /// `<project>/.kage/runs/<id>/` instead, was refused for reaching outside its sandbox, and
+    /// spent twenty minutes failing to write a file it had been given the correct path to.
+    ///
+    /// Kage is driven by imperfect agents by design, so a path that can be normalised into a wrong
+    /// one is a defect here rather than a mistake there. No run id either: a worktree belongs to
+    /// exactly one run, and repeating it was the other half of the ambiguity.
+    const WORKTREE_ARTIFACTS: &str = ".kage-run";
+
     /// The pair of locations a running phase uses, given where its agents will actually run.
     pub fn for_run(project: &Project, run_id: &str, workdir: &Path) -> Self {
         let canonical = project.run_dir(run_id);
@@ -124,10 +138,7 @@ impl Artifacts {
         }
 
         Self {
-            dir: workdir
-                .join(crate::config::KAGE_DIR)
-                .join("runs")
-                .join(run_id),
+            dir: workdir.join(Self::WORKTREE_ARTIFACTS),
             mirror: Some(canonical),
         }
     }
@@ -303,6 +314,35 @@ mod tests {
 
         assert_eq!(resolve(&project, None).unwrap().id, "run_20260809_002");
         assert!(resolve(&project, Some("run_nope")).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_worktree_artifact_path_repeats_no_segment_of_the_route_to_it() {
+        // The bug this guards: artifacts under `<worktree>/.kage/runs/<id>/` gave a path with
+        // `.kage` twice and the run id twice, because the worktree itself lives under
+        // `<project>/.kage/worktrees/<id>/`. An executor collapsed the repetition, asked for a path
+        // outside its sandbox, was refused, and spent twenty minutes writing nothing.
+        let (root, project) = project("no-repeat");
+        let worktree = project.worktrees_dir().join("run_20260810_001");
+
+        let artifacts = Artifacts::for_run(&project, "run_20260810_001", &worktree);
+        let relative = artifacts
+            .execution()
+            .strip_prefix(&worktree)
+            .expect("artifacts live inside the worktree")
+            .to_string_lossy()
+            .replace('\\', "/");
+
+        assert!(
+            !relative.contains(".kage/"),
+            "the path inside the worktree repeats `.kage`: {relative}"
+        );
+        assert!(
+            !relative.contains("run_20260810_001"),
+            "the path inside the worktree repeats the run id: {relative}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

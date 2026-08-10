@@ -13,12 +13,16 @@ use crate::git;
 /// against — so an oversized diff is truncated and labelled as such.
 const MAX_DIFF_CHARS: usize = 120_000;
 
-/// Keep Kage's own run directory out of the diff.
+/// Keep Kage's own files out of the diff.
 ///
 /// An isolated run writes its plan, review, and prompts inside the worktree so the agents can reach
 /// them. Without this the reviewer would be shown its own artifacts as if the executor had authored
-/// them, and every run would look like it touched `.kage/`.
-pub(crate) const EXCLUDE_KAGE: &str = ":(exclude).kage";
+/// them, and every run would look like it touched Kage's directories.
+///
+/// Two entries because they are different things: `.kage` is the project's own configuration, which
+/// a repository may commit and an agent must not quietly edit, while `.kage-run` is this run's
+/// scratch copy of its artifacts, which no diff should ever contain.
+pub(crate) const EXCLUDE_KAGE: &[&str] = &[":(exclude).kage", ":(exclude).kage-run"];
 
 /// Everything that changed since `base_commit`, committed or not.
 ///
@@ -31,11 +35,19 @@ pub async fn since(workdir: &Path, base_commit: &str) -> Result<String> {
     // paths visible to `git diff`.
     let _ = git::git(
         workdir,
-        &["add", "--all", "--intent-to-add", "--", ".", EXCLUDE_KAGE],
+        &[
+            &["add", "--all", "--intent-to-add", "--", "."][..],
+            EXCLUDE_KAGE,
+        ]
+        .concat(),
     )
     .await;
 
-    let diff = git::git(workdir, &["diff", base_commit, "--", ".", EXCLUDE_KAGE]).await?;
+    let diff = git::git(
+        workdir,
+        &[&["diff", base_commit, "--", "."][..], EXCLUDE_KAGE].concat(),
+    )
+    .await?;
 
     if diff.trim().is_empty() {
         return Ok("_(no changes were made)_".to_string());
@@ -48,12 +60,20 @@ pub async fn since(workdir: &Path, base_commit: &str) -> Result<String> {
 pub async fn stat(workdir: &Path, base_commit: &str) -> Result<String> {
     let _ = git::git(
         workdir,
-        &["add", "--all", "--intent-to-add", "--", ".", EXCLUDE_KAGE],
+        &[
+            &["add", "--all", "--intent-to-add", "--", "."][..],
+            EXCLUDE_KAGE,
+        ]
+        .concat(),
     )
     .await;
     Ok(git::git(
         workdir,
-        &["diff", "--stat", base_commit, "--", ".", EXCLUDE_KAGE],
+        &[
+            &["diff", "--stat", base_commit, "--", "."][..],
+            EXCLUDE_KAGE,
+        ]
+        .concat(),
     )
     .await?
     .trim()
@@ -145,12 +165,16 @@ mod tests {
         let (root, base) = repo("exclude-kage").await;
         std::fs::create_dir_all(root.join(".kage/runs/run_1")).unwrap();
         std::fs::write(root.join(".kage/runs/run_1/PLAN.md"), "# Objective\n").unwrap();
+        // The in-worktree copy an isolated run actually writes.
+        std::fs::create_dir_all(root.join(".kage-run/logs")).unwrap();
+        std::fs::write(root.join(".kage-run/REVIEW.md"), "# Review\n").unwrap();
         std::fs::write(root.join("real-work.txt"), "the actual change\n").unwrap();
 
         let diff = since(&root, &base).await.unwrap();
 
         assert!(diff.contains("real-work.txt"), "{diff}");
         assert!(!diff.contains("PLAN.md"), "kage artifacts leaked:\n{diff}");
+        assert!(!diff.contains("REVIEW.md"), "kage-run leaked:\n{diff}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
