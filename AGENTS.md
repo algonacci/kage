@@ -160,6 +160,13 @@ skipping the plan must not mean skipping the gate. The executor and reviewer pro
 is no plan rather than handed an empty one — "PLAN.md is missing" reads to an agent as a fault to
 report, and to a reviewer as an invitation to return BLOCKED.
 
+**`--skip-plan` is about step count, not about whether design is needed.** A plan is a checklist
+as much as a design, and the checklist is what a cheap executor follows. A run that skipped planning
+because "the implementation already exists, so no architect is needed" produced nothing but the
+easiest item on its list and stopped; the identical task with planning restored produced 1862 lines
+that held under sabotage. Skip the plan for a change with one coherent step. Keep it for anything
+with several distinct pieces, however settled the design is.
+
 **A path handed to an agent must not repeat a segment of the route to it.** An isolated run's
 artifacts live at `.kage-run/` inside the worktree, not `.kage/runs/<id>/`. The worktree is already
 `<project>/.kage/worktrees/<id>/`, so the old shape produced a path with `.kage` twice and the run
@@ -259,6 +266,14 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
+- **Run ids restart when `.kage/runs/` is deleted, and a reused id silently reuses its branch.**
+  Attaching to an existing branch is deliberate — it is what makes `kage resume` work — but nothing
+  distinguishes that from a fresh run that happens to collide, so a new run can append to an older
+  run's history without saying so.
+- **A worktree inside the project is a second copy of the project.** Tools that walk the tree find
+  it: biome refused to lint at all while a worktree's own `biome.json` sat under `.kage/worktrees/`,
+  and jest, eslint and ripgrep have the same exposure. `kage clean` is therefore not only about
+  disk.
 - **A worktree prepared once is not prepared again.** `setup.commands` runs at `kage run`, not at
   `kage resume` — a resumed run whose worktree was rebuilt by `kage clean` starts with an empty
   `node_modules` and no setup to fill it.
