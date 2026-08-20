@@ -403,7 +403,7 @@ impl Default for GitConfig {
 ///
 /// These run in Kage's own process rather than inside an agent, because an agent reporting "tests
 /// pass" is a claim and an exit code is evidence.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Validation {
     #[serde(default)]
@@ -416,6 +416,19 @@ fn default_validation_timeout() -> u64 {
     900
 }
 
+/// Hand-written rather than derived so the whole-block default matches the per-field one. Serde
+/// applies `default = "default_validation_timeout"` only when `validation:` is present in the YAML;
+/// with the block omitted the *struct* default is used, and a derived one would hand the gate a
+/// zero-second budget that kills its first command as "timed out after 0s".
+impl Default for Validation {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            timeout_secs: default_validation_timeout(),
+        }
+    }
+}
+
 /// Commands that make a freshly created worktree usable.
 ///
 /// A worktree is a clean checkout of tracked files, and every language that keeps its dependencies
@@ -426,7 +439,7 @@ fn default_validation_timeout() -> u64 {
 ///
 /// These run once, after the worktree is created and before the first phase, and a failure aborts
 /// the run before an agent is spawned — a gate that cannot run is not a gate.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Setup {
     #[serde(default)]
@@ -437,6 +450,17 @@ pub struct Setup {
 
 fn default_setup_timeout() -> u64 {
     900
+}
+
+/// Hand-written for the same reason as [`Validation`]: a `setup:` block left out of the config must
+/// still get the documented timeout, not the zero a derived `Default` would produce.
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            timeout_secs: default_setup_timeout(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +478,20 @@ mod tests {
         assert_eq!(config.roles.planner.adapter, AdapterKind::ClaudeCode);
         assert_eq!(config.roles.executor.adapter, AdapterKind::OpenCode);
         assert_eq!(config.roles.reviewer.adapter, AdapterKind::Codex);
+    }
+
+    #[test]
+    fn an_omitted_setup_or_validation_block_still_gets_its_timeout() {
+        // The bug this guards: both structs derived `Default` while their `timeout_secs` carried a
+        // `#[serde(default = "...")]`. Serde only consults the field default when the block is
+        // present, so a config without `setup:` or `validation:` deserialized to a zero-second
+        // budget and the first command run under it died with "timed out after 0s".
+        let config: Config = serde_yaml_ng::from_str("version: 1").unwrap();
+
+        assert_eq!(config.setup.timeout_secs, 900);
+        assert_eq!(config.validation.timeout_secs, 900);
+        assert_eq!(Setup::default().timeout_secs, 900);
+        assert_eq!(Validation::default().timeout_secs, 900);
     }
 
     #[test]
