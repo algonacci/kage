@@ -82,7 +82,21 @@ impl Project {
 
     /// Run ids are date-ordered and human-readable (`run_20260809_001`) so that sorting a directory
     /// listing sorts chronologically, and a user can say "run 3 from Sunday" out loud.
-    pub fn next_run_id(&self, now: chrono::DateTime<chrono::Local>) -> Result<String> {
+    ///
+    /// An id is also a branch name, so both namespaces are consulted. Scanning `.kage/runs/` alone
+    /// restarted the sequence at 001 whenever that directory was deleted, while `kage/run_<date>_001`
+    /// was still there holding the earlier run's commits — and a fresh run took that id and appended
+    /// to another run's history without saying so. Attaching to an existing branch is deliberate and
+    /// unchanged: it is what makes `kage resume` work, and resume never allocates an id. This is only
+    /// about which id a *new* run may be handed.
+    ///
+    /// `branches` is a parameter rather than something read here: allocation stays pure and testable,
+    /// and the caller is the one that already knows whether there is a repository to ask at all.
+    pub fn next_run_id(
+        &self,
+        now: chrono::DateTime<chrono::Local>,
+        branches: &[String],
+    ) -> Result<String> {
         let date = now.format("%Y%m%d").to_string();
         let prefix = format!("run_{date}_");
 
@@ -93,17 +107,28 @@ impl Project {
                 .with_context(|| format!("cannot read {}", runs.display()))?
             {
                 let name = entry?.file_name().to_string_lossy().into_owned();
-                let Some(sequence) = name.strip_prefix(&prefix) else {
-                    continue;
-                };
-                if let Ok(value) = sequence.parse::<usize>() {
+                if let Some(value) = sequence_in(&name, &prefix) {
                     highest = highest.max(value);
                 }
             }
         }
 
+        for branch in branches {
+            let Some(run_id) = branch.strip_prefix(crate::git::worktree::BRANCH_PREFIX) else {
+                continue; // Someone else's branch; Kage only owns its own namespace.
+            };
+            if let Some(value) = sequence_in(run_id, &prefix) {
+                highest = highest.max(value);
+            }
+        }
+
         Ok(format!("{prefix}{:03}", highest + 1))
     }
+}
+
+/// The sequence number in `run_<date>_<seq>`, when `name` is one of today's ids at all.
+fn sequence_in(name: &str, prefix: &str) -> Option<usize> {
+    name.strip_prefix(prefix)?.parse::<usize>().ok()
 }
 
 /// Create `.kage/` with a starter config. Returns the path to the config that was written.
@@ -286,12 +311,77 @@ mod tests {
         let project = Project::discover(&root).unwrap();
         let now = chrono::Local::now();
 
-        let first = project.next_run_id(now).unwrap();
+        let first = project.next_run_id(now, &[]).unwrap();
         std::fs::create_dir_all(project.run_dir(&first)).unwrap();
-        let second = project.next_run_id(now).unwrap();
+        let second = project.next_run_id(now, &[]).unwrap();
 
         assert!(first.ends_with("_001"), "got {first}");
         assert!(second.ends_with("_002"), "got {second}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_branch_still_claims_its_run_id_after_the_run_directory_is_gone() {
+        // The bug this guards: ids were allocated by scanning `.kage/runs/` alone, so deleting that
+        // directory restarted the sequence at 001 while `kage/run_<date>_001` was still there
+        // holding the earlier run's commits. The new run attached to that branch — attaching is
+        // deliberate, it is what makes `kage resume` work — and appended to another run's history
+        // with nothing to distinguish it from a real resume.
+        let root = temp_dir("branch-ids");
+        init(&root, false).unwrap();
+        let project = Project::discover(&root).unwrap();
+        let now = chrono::Local::now();
+        let date = now.format("%Y%m%d").to_string();
+
+        // Exactly the state after `.kage/runs/` is deleted: no run directories, branches intact.
+        let branches = vec![
+            "main".to_string(),
+            format!("kage/run_{date}_001"),
+            format!("kage/run_{date}_002"),
+        ];
+
+        assert_eq!(
+            project.next_run_id(now, &[]).unwrap(),
+            format!("run_{date}_001"),
+            "the run directory alone cannot see the earlier runs"
+        );
+        assert_eq!(
+            project.next_run_id(now, &branches).unwrap(),
+            format!("run_{date}_003"),
+            "a fresh run must not be handed an id whose branch already holds work"
+        );
+
+        // Whichever namespace has gone furthest decides, so the two cannot leapfrog each other.
+        std::fs::create_dir_all(project.run_dir(&format!("run_{date}_005"))).unwrap();
+        assert_eq!(
+            project.next_run_id(now, &branches).unwrap(),
+            format!("run_{date}_006")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn branches_outside_kages_namespace_do_not_move_the_sequence() {
+        let root = temp_dir("foreign-branches");
+        init(&root, false).unwrap();
+        let project = Project::discover(&root).unwrap();
+        let now = chrono::Local::now();
+        let date = now.format("%Y%m%d").to_string();
+
+        let branches = vec![
+            format!("run_{date}_042"),
+            format!("feature/run_{date}_042"),
+            format!("kage/run_{date}_notanumber"),
+            format!("kage/run_19700101_099"),
+        ];
+
+        assert_eq!(
+            project.next_run_id(now, &branches).unwrap(),
+            format!("run_{date}_001"),
+            "only Kage's own branches for today claim an id"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

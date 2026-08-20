@@ -156,6 +156,33 @@ impl Artifacts {
             .with_context(|| format!("cannot mirror artifacts to {}", mirror.display()))
     }
 
+    /// Copy the durable artifacts back into a worktree that no longer has them.
+    ///
+    /// The mirror exists because the worktree is disposable; this is the other half of that deal.
+    /// `.kage/` is never committed, so a worktree rebuilt on `kage resume` after `kage clean` is a
+    /// checkout of tracked files and nothing else: no `PLAN.md`, no `TEST_RESULTS.md`, and the next
+    /// prompt embeds their placeholders — the reviewer is handed "_(not produced …)_" where the plan
+    /// it must judge against belongs, while the project's mirror holds the real one all along.
+    ///
+    /// `EXECUTION.md` is deliberately not restored. It is the one artifact tied to a single attempt
+    /// rather than to the run: both phases that write it delete any previous one first, precisely so
+    /// a past attempt's account cannot be presented as this one's, and copying a mirrored account
+    /// back in would reintroduce exactly what those deletions prevent. Its absence already has a
+    /// designed remedy — the executor is asked once more for just the summary, written against the
+    /// current diff — and that remedy is the only one that can promise the account describes the
+    /// work now on the branch.
+    pub fn restore(&self) -> Result<()> {
+        let Some(mirror) = &self.mirror else {
+            return Ok(());
+        };
+
+        copy_tree(mirror, &self.dir)
+            .with_context(|| format!("cannot restore artifacts from {}", mirror.display()))?;
+
+        let _ = std::fs::remove_file(self.execution());
+        Ok(())
+    }
+
     pub fn request(&self) -> PathBuf {
         self.dir.join("REQUEST.md")
     }
@@ -401,6 +428,96 @@ mod tests {
         assert!(
             durable.logs_dir().join("planner.log").is_file(),
             "nested directories must be mirrored too"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_rebuilt_worktree_gets_its_artifacts_back_from_the_mirror() {
+        // The bug this guards: `.kage/` is never committed, so a worktree recreated by `kage resume`
+        // after `kage clean` held no PLAN.md or TEST_RESULTS.md. The prompts built there embedded
+        // "_(not produced — PLAN.md is missing or empty)_" and the reviewer judged the work against
+        // a placeholder, while the project's mirror held the real plan the whole time.
+        let (root, project) = project("restore");
+        let worktree = root.join(".kage/worktrees/run_1");
+        let artifacts = Artifacts::for_run(&project, "run_1", &worktree);
+        artifacts.ensure_dirs().unwrap();
+
+        std::fs::write(artifacts.plan(), "# Objective\nship it").unwrap();
+        std::fs::write(artifacts.test_results(), "# Test Results\nall green").unwrap();
+        std::fs::write(artifacts.logs_dir().join("planner.log"), "output").unwrap();
+        artifacts.sync().unwrap();
+
+        // `kage clean` removes the checkout, and `kage resume` rebuilds it from the branch.
+        std::fs::remove_dir_all(&worktree).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        assert!(
+            !artifacts.has_content(&artifacts.plan()),
+            "a rebuilt checkout starts with no artifacts in it"
+        );
+
+        artifacts.restore().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(artifacts.plan()).unwrap(),
+            "# Objective\nship it"
+        );
+        assert!(artifacts.has_content(&artifacts.test_results()));
+        assert!(
+            artifacts.logs_dir().join("planner.log").is_file(),
+            "nested directories must come back too"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_restored_worktree_still_has_to_ask_for_the_executors_account() {
+        // EXECUTION.md is tied to one attempt rather than to the run: both phases that write it
+        // delete any previous one first, so that a past attempt's account is never presented as
+        // this one's. Restoring a mirrored account would reintroduce exactly that, and the run
+        // would review the current diff against an older attempt's claims.
+        let (root, project) = project("restore-account");
+        let worktree = root.join(".kage/worktrees/run_1");
+        let artifacts = Artifacts::for_run(&project, "run_1", &worktree);
+        artifacts.ensure_dirs().unwrap();
+
+        std::fs::write(artifacts.plan(), "# Objective\nship it").unwrap();
+        std::fs::write(artifacts.execution(), "an earlier attempt's account").unwrap();
+        artifacts.sync().unwrap();
+
+        std::fs::remove_dir_all(&worktree).unwrap();
+        artifacts.restore().unwrap();
+
+        assert!(artifacts.has_content(&artifacts.plan()));
+        assert!(
+            !artifacts.has_content(&artifacts.execution()),
+            "the account must be re-asked for, not copied back"
+        );
+        // The mirror still keeps it — `kage status` reads that copy.
+        let durable = Artifacts::new(&project, "run_1");
+        assert!(
+            durable.has_content(&durable.execution()),
+            "restoring must not damage the durable copy"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn restoring_without_a_mirror_is_a_no_op() {
+        let (root, project) = project("restore-plain");
+
+        let artifacts = Artifacts::for_run(&project, "run_1", &project.root);
+        artifacts.ensure_dirs().unwrap();
+        std::fs::write(artifacts.execution(), "the only copy there is").unwrap();
+
+        artifacts.restore().unwrap();
+
+        assert!(
+            artifacts.has_content(&artifacts.execution()),
+            "a non-isolated run's artifacts are the durable ones — restore must not delete them"
         );
 
         let _ = std::fs::remove_dir_all(&root);

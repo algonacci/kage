@@ -179,6 +179,25 @@ worktree is created. A clean checkout has no `node_modules`, so a JavaScript pro
 every phase for reasons the change did not cause. Cargo's shared registry cache hid this until Kage
 was first pointed at a project it had not built.
 
+**A rebuilt worktree is a new worktree, so it is prepared and refilled like one.** `kage clean`
+removes the checkout and keeps the branch by design, so rebuilding one is the ordinary `kage resume`
+path rather than an edge case — and `git worktree add` restores the tracked files and nothing else.
+Both untracked things the loop depends on are put back at that one site (`restore_workdir`): what
+`setup.commands` installs, and the run's own artifacts, copied in from the project's mirror because
+`.kage/` is never committed. Only when the checkout was actually recreated: an intact one was
+prepared when it was made and holds work newer than the mirror, so doing either unconditionally
+would re-pay a long install on every resume, give `kage resume` a failure mode it does not have, and
+overwrite a phase's work in progress. `EXECUTION.md` is the one artifact not restored — it belongs
+to a single attempt, which is why both phases that write it delete a previous one first, and its
+absence already has a better remedy in the re-ask written against the current diff.
+
+**A run id is allocated across both namespaces that can already hold it.** An id names a run
+directory *and* a branch, and the branch outlives the directory on purpose. Scanning only
+`.kage/runs/` meant deleting that directory restarted the sequence at 001 while `kage/run_<date>_001`
+still held the earlier run's commits, and the fresh run attached to it and appended to another run's
+history without a word. Attaching to an existing branch stays exactly as it was — it is what makes
+`kage resume` work, and resume never allocates an id; the check belongs where a *new* id is chosen.
+
 **The gate is checked green before the run depends on it, and warns rather than refuses.** A red
 gate cannot judge the work. But "fix the failing build" is a legitimate task, so the check records
 the baseline in `TEST_RESULTS.md` instead of blocking — the failure must not be silent, and it must
@@ -266,25 +285,14 @@ Honest list of what does not work yet. Do not assume the code is complete becaus
 Keep this current. It is read before work starts, so a stale entry sends the next agent to fix
 something already fixed — and a fixed entry left here is a lie told with authority.
 
-- **Run ids restart when `.kage/runs/` is deleted, and a reused id silently reuses its branch.**
-  Attaching to an existing branch is deliberate — it is what makes `kage resume` work — but nothing
-  distinguishes that from a fresh run that happens to collide, so a new run can append to an older
-  run's history without saying so.
 - **A worktree inside the project is a second copy of the project.** Tools that walk the tree find
   it: biome refused to lint at all while a worktree's own `biome.json` sat under `.kage/worktrees/`,
   and jest, eslint and ripgrep have the same exposure. `kage clean` is therefore not only about
   disk.
-- **A worktree prepared once is not prepared again.** `setup.commands` runs at `kage run`, not at
-  `kage resume` — a resumed run whose worktree was rebuilt by `kage clean` starts with an empty
-  `node_modules` and no setup to fill it.
 - **A phase that keeps talking while going nowhere still costs its full budget.** Silence is now
   acted on (see the stall decision above), but a harness looping noisily is mechanically
   indistinguishable from one working — telling them apart needs judgment about the output, not a
   clock on it.
-- **A resumed run's recreated worktree starts with no artifacts in it.** `.kage/` is never
-  committed, so a worktree rebuilt on `kage resume` has no `PLAN.md` or `TEST_RESULTS.md`, and a
-  prompt built there embeds their placeholders. The missing `EXECUTION.md` is re-asked for; the
-  others are not restored from the project's mirror, which holds them.
 - **The `# Deferred Tasks` contract has not met a live planner.** The instruction, the extraction,
   and the surfacing are tested; whether real planners honour the "omit when it fits" rule is
   exactly the kind of thing a green suite cannot prove. Watch the first oversized run.
@@ -294,9 +302,11 @@ something already fixed — and a fixed entry left here is a lie told with autho
 Kage has built five of its own features, and the scoping-and-budgeting queue that followed is
 clear: the live log has a readable twin, broken builds and review findings spend separate budgets,
 a silent phase is aborted early, task sizing is declared by the planner at the point of use, and
-cross-repo work is a recorded boundary rather than a pending gap. What remains above is small; the
-next real work is the roadmap's graph engineering, which this file's own rule gates behind the
-loop staying reliable.
+cross-repo work is a recorded boundary rather than a pending gap. The resume path has since been
+closed up too — a rebuilt worktree is prepared and gets its artifacts back, and a fresh run can no
+longer be handed an id whose branch already holds someone else's work. What remains above is three
+entries, two of which are watch-items rather than work. The next real work is the roadmap's graph
+engineering, which this file's own rule gates behind the loop staying reliable.
 
 Two lessons worth carrying into whatever comes next, both learned the expensive way:
 

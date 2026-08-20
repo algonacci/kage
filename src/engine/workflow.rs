@@ -82,13 +82,21 @@ pub async fn start(
     // calls.
     preflight::check(config, &required_roles(options.skip_plan))?;
 
-    let run_id = project.next_run_id(chrono::Local::now())?;
+    let isolate = config.git.isolate && !options.no_isolate;
+    let in_repo = git::is_repo(&project.root).await;
+
+    // Existing branches are asked before an id is chosen, not after: a branch outlives `.kage/runs/`
+    // by design, so the run directory alone cannot say whether an id was already used, and a reused
+    // id attaches to that branch and appends to its history without a word.
+    let branches = if in_repo {
+        git::branch_names(&project.root).await?
+    } else {
+        Vec::new()
+    };
+    let run_id = project.next_run_id(chrono::Local::now(), &branches)?;
     let max_iterations = options
         .max_iterations
         .unwrap_or(config.loop_config.max_iterations);
-
-    let isolate = config.git.isolate && !options.no_isolate;
-    let in_repo = git::is_repo(&project.root).await;
 
     let mut state = RunState::new(
         run_id.clone(),
@@ -213,19 +221,7 @@ pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> 
     preflight::check(config, &required_roles(state.skip_plan))?;
 
     // A worktree can be removed between runs; recreate it so a resumed run still has its checkout.
-    if let Some(worktree) = &state.worktree
-        && !worktree.path.exists()
-    {
-        let restored = git::worktree::create(
-            &project.root,
-            &project.worktrees_dir(),
-            &state.id,
-            config.git.base.as_deref(),
-        )
-        .await?;
-        state.workdir = restored.path.clone();
-        state.worktree = Some(restored);
-    }
+    restore_workdir(project, config, &mut state).await?;
 
     // A failed or blocked run is terminal, so re-entering the phase it died in is the only way
     // resuming can do anything at all.
@@ -242,6 +238,48 @@ pub async fn resume(project: &Project, config: &Config, mut state: RunState) -> 
     store::save(project, &state)?;
 
     drive(project, config, state).await
+}
+
+/// Give a resumed run back the working directory the loop assumes it still has.
+///
+/// `kage clean` removes the checkout and keeps the branch by design, so rebuilding the worktree is
+/// the ordinary resume path, not an edge case. `git worktree add` restores the *tracked* files and
+/// nothing else, and the loop depends on two things that are not tracked:
+///
+/// - whatever `setup.commands` installs. A clean checkout has no `node_modules`, so the validation
+///   gate fails on every phase for reasons the change did not cause and the repair budget is spent
+///   on an empty directory — the same failure `start` pays `runner::prepare` to avoid, arriving
+///   through a different door.
+/// - the run's own artifacts, which `.kage/` being uncommitted keeps out of every checkout. The
+///   mirror under the project's `.kage/runs/` is where they survived `kage clean`.
+///
+/// Both are done only when the worktree was actually recreated, never on every resume. An intact
+/// checkout was already prepared when it was created and holds artifacts newer than the mirror's,
+/// so preparing unconditionally would re-pay a possibly long install on every resume and give
+/// `kage resume` a failure mode it does not have today (`prepare` aborts the run), while restoring
+/// unconditionally would overwrite a phase's in-progress work with the last mirrored copy.
+async fn restore_workdir(project: &Project, config: &Config, state: &mut RunState) -> Result<()> {
+    let Some(worktree) = &state.worktree else {
+        // Not isolated: the working directory is the user's own tree, which Kage never prepares.
+        return Ok(());
+    };
+    if worktree.path.exists() {
+        return Ok(());
+    }
+
+    let restored = git::worktree::create(
+        &project.root,
+        &project.worktrees_dir(),
+        &state.id,
+        config.git.base.as_deref(),
+    )
+    .await?;
+    state.workdir = restored.path.clone();
+    state.worktree = Some(restored);
+
+    // Same order as `start`: a worktree is prepared before anything is asked of it.
+    runner::prepare(&state.workdir, &config.setup).await?;
+    Artifacts::for_run(project, &state.id, &state.workdir).restore()
 }
 
 /// Drive the run, then put its work somewhere it can survive the worktree being deleted.
@@ -998,6 +1036,155 @@ mod tests {
             PathBuf::from("."),
             max_iterations,
         )
+    }
+
+    /// A committed repository with a Kage project, an isolated run, and a plan in the mirror —
+    /// the state `kage clean` is pointed at.
+    async fn isolated_run(label: &str) -> (PathBuf, Project, Config, RunState) {
+        let root = std::env::temp_dir().join(format!("kage-wf-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        git::git(&root, &["init", "-b", "main"]).await.unwrap();
+        git::git(&root, &["config", "user.email", "kage@test.local"])
+            .await
+            .unwrap();
+        git::git(&root, &["config", "user.name", "Kage Test"])
+            .await
+            .unwrap();
+        std::fs::write(root.join("a.txt"), "tracked").unwrap();
+        git::git(&root, &["add", "."]).await.unwrap();
+        git::git(&root, &["commit", "-m", "initial"]).await.unwrap();
+
+        crate::config::init(&root, true).unwrap();
+        let project = Project::discover(&root).unwrap();
+        // `Setup` derives Default, so a config with no `setup:` block at all carries a zero
+        // timeout; a test that means to run a setup command has to say how long it may take.
+        let mut config: Config = serde_yaml_ng::from_str("{}").unwrap();
+        config.setup.timeout_secs = 60;
+
+        let worktree =
+            git::worktree::create(&project.root, &project.worktrees_dir(), "run_1", None)
+                .await
+                .unwrap();
+
+        let mut state = RunState::new(
+            "run_1".to_string(),
+            "task".to_string(),
+            worktree.path.clone(),
+            3,
+        );
+        state.workdir = worktree.path.clone();
+        state.worktree = Some(worktree);
+
+        let artifacts = Artifacts::for_run(&project, "run_1", &state.workdir);
+        artifacts.ensure_dirs().unwrap();
+        std::fs::write(artifacts.plan(), "# Objective\nship it").unwrap();
+        artifacts.sync().unwrap();
+
+        (root, project, config, state)
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_worktree_is_prepared_before_the_resumed_run_uses_it() {
+        // The bug this guards: `setup.commands` ran at `kage run` and nowhere else, so a run
+        // resumed after `kage clean` started in a checkout with an empty `node_modules` and no
+        // setup to fill it — the validation gate then failed on every phase for reasons the change
+        // did not cause, spending the repair budget on the environment.
+        let (root, project, mut config, mut state) = isolated_run("prepare-on-resume").await;
+        config.setup.commands = vec!["echo prepared > prepared.txt".to_string()];
+
+        let checkout = state.workdir.clone();
+        git::worktree::remove(&project.root, &checkout)
+            .await
+            .unwrap();
+        assert!(
+            !checkout.exists(),
+            "the checkout is gone, the branch remains"
+        );
+
+        restore_workdir(&project, &config, &mut state)
+            .await
+            .unwrap();
+
+        assert!(
+            state.workdir.join("prepared.txt").is_file(),
+            "the rebuilt worktree was never prepared"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_worktree_gets_the_runs_artifacts_back_before_a_prompt_is_built() {
+        // The bug this guards: `.kage/` is never committed, so the rebuilt checkout had no PLAN.md
+        // and the next prompt embedded its placeholder — the executor and reviewer were told the
+        // plan was "not produced" while the project's mirror held it.
+        let (root, project, config, mut state) = isolated_run("restore-on-resume").await;
+
+        let checkout = state.workdir.clone();
+        git::worktree::remove(&project.root, &checkout)
+            .await
+            .unwrap();
+
+        restore_workdir(&project, &config, &mut state)
+            .await
+            .unwrap();
+
+        let artifacts = Artifacts::for_run(&project, "run_1", &state.workdir);
+        assert!(
+            artifacts.has_content(&artifacts.plan()),
+            "the resumed run would build its prompts around a placeholder"
+        );
+        assert!(
+            !artifacts
+                .read_or_placeholder(&artifacts.plan())
+                .contains("missing or empty")
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_intact_worktree_is_neither_prepared_again_nor_overwritten() {
+        // Preparing on every resume would re-pay a possibly long install and hand `kage resume` a
+        // failure mode it does not have; restoring would overwrite a phase's in-progress work with
+        // the last mirrored copy. A setup command that always fails proves neither happens.
+        let (root, project, mut config, mut state) = isolated_run("intact-worktree").await;
+        config.setup.commands = vec!["exit 3".to_string()];
+
+        let artifacts = Artifacts::for_run(&project, "run_1", &state.workdir);
+        std::fs::write(artifacts.plan(), "# Objective\nnewer than the mirror").unwrap();
+
+        restore_workdir(&project, &config, &mut state)
+            .await
+            .expect("an intact worktree needs no preparation");
+
+        assert_eq!(
+            std::fs::read_to_string(artifacts.plan()).unwrap(),
+            "# Objective\nnewer than the mirror",
+            "work in progress must not be replaced by the mirror"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_worktree_is_left_alone_on_resume() {
+        // `--no-isolate` points the run at the user's own tree. Kage prepares a worktree it made;
+        // it does not run install commands in a tree the user is working in.
+        let (root, project, mut config, mut state) = isolated_run("no-worktree").await;
+        config.setup.commands = vec!["exit 3".to_string()];
+        state.worktree = None;
+        state.workdir = project.root.clone();
+
+        restore_workdir(&project, &config, &mut state)
+            .await
+            .unwrap();
+
+        assert_eq!(state.workdir, project.root);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

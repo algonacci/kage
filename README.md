@@ -194,10 +194,12 @@ setup:
   timeout_secs: 900
 ```
 
-These run once, after the worktree is created and before the first phase. A failure aborts the run
-before an agent is spawned, because a gate that cannot run is not a gate — without this, `npm test`
-fails on every phase of every run for reasons that have nothing to do with the change. Cargo hides
-the problem by sharing a global registry cache, which is why it is easy to forget.
+These run once per worktree, after it is created and before the first phase — including when
+`kage resume` has to rebuild a checkout that `kage clean` removed, since that checkout arrives just
+as bare as the first one did. A failure aborts the run before an agent is spawned, because a gate
+that cannot run is not a gate — without this, `npm test` fails on every phase of every run for
+reasons that have nothing to do with the change. Cargo hides the problem by sharing a global
+registry cache, which is why it is easy to forget.
 
 ### The gate is checked before the run depends on it
 

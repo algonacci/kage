@@ -12,6 +12,18 @@ use anyhow::{Context, Result, bail};
 use crate::git;
 use crate::state::Worktree;
 
+/// The namespace every run's branch lives in.
+///
+/// A run id and its branch name are the same fact written twice, so this is shared with id
+/// allocation rather than spelled out in both places: allocating an id that a branch already claims
+/// is what let a fresh run append to an older run's history.
+pub const BRANCH_PREFIX: &str = "kage/";
+
+/// The branch a run's work lands on.
+pub fn branch_for(run_id: &str) -> String {
+    format!("{BRANCH_PREFIX}{run_id}")
+}
+
 /// Create a worktree for `run_id`, branching from `base` (or current HEAD).
 pub async fn create(
     root: &Path,
@@ -30,7 +42,7 @@ pub async fn create(
         .with_context(|| format!("cannot create {}", worktrees_dir.display()))?;
 
     let path = path_for(worktrees_dir, run_id);
-    let branch = format!("kage/{run_id}");
+    let branch = branch_for(run_id);
 
     if path.exists() {
         // A resumed run reuses its worktree; recreating it would throw away the work in progress.
