@@ -346,3 +346,172 @@ All three are read-only and leave `Phase`/`RunState` untouched. Option C can shi
 - Prompts: `src/engine/prompts.rs` (planner/executor/reviewer/fixer/account, `preamble`, `deliverable`, `Brief`, `Delivery`)
 - State: `src/state/store.rs` (`Artifacts`, `read_or_placeholder`, `for_run`, `sync`/`restore`), `src/state/run.rs` (`Phase`, `RunState`), `src/engine/workflow.rs::run_phases` (call sites)
 - PRD: `docs/PRD.md` §7.2–7.4 (CodeGraph integration options, subagent partitioning)
+
+---
+
+## 7. Upstream `colbymchenry/codegraph` — Research for Kage Implementation
+
+> **Requested:** `https://github.com/colbymchenry/codegraph` — the upstream Rust-kernel codegraph that the local `.codegraph/` in this repo comes from. This section complements §§1–6 (which covered the local DB + `@vndv/pi-codegraph` Pi tools) with the upstream's CLI/MCP/library surface and how Kage should consume it.
+
+### 7.1 What It Is
+
+| Fact | Value |
+|------|-------|
+| Repo | `colbymchenry/codegraph` — MIT, Rust kernel + tree-sitter, SQLite + FTS5, 100% local |
+| Stars | ~68k · 4.3k forks · 459 issues (as of 2026-08-31) |
+| Package | `@colbymchenry/codegraph` on npm — self-contained bundled Node runtime, no native build |
+| Installed here | `codegraph 1.5.0` at `~/.local/state/fnm_multishells/.../bin/codegraph` · npm latest `1.6.0` |
+| Local index | `.codegraph/codegraph.db` 2.37 MB · 27 files · 692 nodes · 1902 edges · WAL (`node:sqlite` built-in) · `index_state=complete` |
+| Languages | 20+ with full extraction (TS/JS, Python, Go, Rust, Java, C#, PHP, Ruby, C/C++, Swift, Kotlin, Scala, Dart, Svelte, Vue, Astro, Lua, CFML, etc.) — per-file tree-sitter, cross-file resolution |
+| Agents wired | Claude Code, Cursor, Codex CLI, opencode, Hermes Agent, Gemini CLI, Antigravity IDE, Kiro, GitHub Copilot (VS Code/CLI/JetBrains) |
+
+**Relationship to `@vndv/pi-codegraph@0.1.10`:** That Pi extension is a thin MCP/tool wrapper (`codegraph_search`, `codegraph_callers`, …) that spawns the upstream `codegraph` MCP server / CLI under the hood. The upstream *is* the index — `pi-codegraph` just surfaces it as Pi tools. For Kage (Rust binary, no Pi runtime), the upstream CLI/MCP/library is the direct dependency; the Pi tools are not needed.
+
+### 7.2 Install & Index (How the DB Gets Built)
+
+```bash
+# One-time per machine (no Node required — bundled runtime)
+curl -fsSL https://raw.githubusercontent.com/colbymchenry/codegraph/main/install.sh | sh
+# or: npm i -g @colbymchenry/codegraph
+
+# Wire MCP to your agents (once, global)
+codegraph install            # auto-detects Claude/Cursor/Codex/opencode/…
+codegraph install --yes --init  # non-interactive + build current project's index
+
+# Per project (one step — creates .codegraph/ and builds graph)
+codegraph init
+codegraph status             # verify: Files/Nodes/Edges/DB Size/Journal: wal
+```
+
+After `init`, the MCP server watches the project with native OS file events — debounce 2 s, source-files only, incremental sync, WAL mode so reads never block on writes. Stale-file banner (`⚠️`) and connect-time `(size, mtime)` + content-hash catch-up handle edits made outside the watcher (e.g. `git pull`). Manual `codegraph sync` only needed when watcher is disabled (`CODEGRAPH_NO_DAEMON=1` or sandboxed env). Verified here: `codegraph status` reports `✓ Index is up to date` with `Journal: wal`.
+
+`.codegraph/.gitignore` is `*` + `!.gitignore` — DB, daemon pid/sockets/logs are machine-local, never committed (same as in §1.1).
+
+### 7.3 CLI Surface (Verified Locally on This Repo)
+
+```bash
+codegraph query <search> [--kind <kind>] [--limit N] [--json]   # FTS5 search, scored
+codegraph explore <query...>                                      # ONE call → verbatim source grouped by file + call paths + blast radius (same as MCP codegraph_explore)
+codegraph node [name]                                             # one symbol's source + callers/callees, or read file with line numbers
+codegraph files [--json] [--max-depth N] [--filter <glob>]       # file structure from index
+codegraph callers <symbol> [--limit N] [--json]                  # who calls this
+codegraph callees <symbol> [--limit N] [--json]                  # what this calls
+codegraph impact <symbol> [--depth N] [--json]                   # transitive blast radius (affected nodes/edges)
+codegraph affected [files...] [--stdin] [--depth N] [--filter <glob>] [--json]  # transitive test-file tracing (import deps)
+codegraph status [path]                                           # stats + staleness
+codegraph sync [path] | index [path] | daemon | upgrade | version
+```
+
+**Verified outputs on `algonacci/kage` (v1.5.0):**
+
+- `codegraph query "workflow" --limit 3 --json` → `file:src/engine/workflow.rs` (score 55.7) + imports — FTS5 ranked.
+- `codegraph callers "run_phases" --json` → `drive` in `src/engine/workflow.rs:291` — single caller.
+- `codegraph impact "RunState" --depth 2 --json` → `nodeCount 68, edgeCount 121`, affected includes `RunState` struct + `RunState::new/transition` + callers across `cli/mod.rs`, `cli/status.rs`, `engine/workflow.rs` — depth-2 BFS, suitable for partitioning.
+- `codegraph explore "how does a run start"` (no `--json` flag) → `Found 50 symbols across 2 files`, **Blast radius** per symbol (callers + `⚠️ no covering tests found`), then **verbatim source** grouped by file (`src/engine/workflow.rs` lines 73–… with `start()`, `required_roles()`, `branch_names()` etc.) — one call replaces multiple `Read`/`Grep`.
+- `codegraph files --json` → `[{path, language, nodeCount, size}]` for 27 files (Rust 25, YAML 2).
+- `codegraph affected src/engine/workflow.rs --json` → `{changedFiles: ["src/engine/workflow.rs"], affectedTests: [], totalDependentsTraversed: 13}` — import-transitive, depth 5 default.
+- `codegraph node "RunState"` → struct outline (4 members: `new`, `transition`, `remaining_iterations`, `remaining_repairs`) + `Called by ←` trail (20+ callers).
+
+> Note: `explore` has no `--json` flag (markdown output); `query`/`callers`/`callees`/`impact`/`files`/`affected` do.
+
+### 7.4 MCP & Library Surfaces
+
+**MCP server** (`codegraph serve --mcp`, wired by `codegraph install` into each agent's `mcpServers`):
+
+- Single listed tool by default: `codegraph_explore` — one call returns source + call flow + blast radius, including dynamic-dispatch hops (callbacks, React re-render, interface→impl) that grep cannot follow. Guidance is delivered in the MCP `initialize` response (`src/mcp/server-instructions.ts`).
+- Other tools (`codegraph_node`, `codegraph_search`, `codegraph_callers`, `codegraph_callees`, `codegraph_impact`, `codegraph_files`, `codegraph_status`) remain functional but unlisted; re-enable via `CODEGRAPH_MCP_TOOLS=explore,node,search,callers` or use CLI equivalents.
+- Per-project: pass `projectPath` to query any indexed project (monorepo sub-service or second repo) in one session; unindexed path returns guidance, not failure.
+
+**Library (npm)** — `import CodeGraph from '@colbymchenry/codegraph'` (Node 22.5+ for built-in `node:sqlite`, or Electron with bundled Node 22.5+):
+
+```ts
+const cg = await CodeGraph.init('/path/to/project');
+await cg.indexAll({ onProgress: p => console.log(`${p.phase}: ${p.current}/${p.total}`) });
+const results = cg.searchNodes('UserService');
+const callers = cg.getCallers(results[0].node.id);
+const impact = cg.getImpactRadius(results[0].node.id, 2);
+const ctx = await cg.buildContext('fix login bug', { maxNodes: 20, includeCode: true, format: 'markdown' });
+cg.watch(); cg.close();
+```
+
+Also exports `DatabaseConnection`, `QueryBuilder`, `getDatabasePath`, `initGrammars`/`loadGrammarsForLanguages`, `FileLock`. CLI/MCP are unaffected by the Node version — they run on the bundled runtime.
+
+**For Kage (Rust binary):** The library is not directly usable (requires Node 22.5+ in-process). The CLI is the correct surface — same pattern as `proc::run` already used for `git`/`cargo`/`rtk`.
+
+### 7.5 Extra Capabilities Relevant to Kage
+
+- **Framework-aware routes** — detects `route` nodes (Django `urls.py`, Flask/FastAPI `@app.route`, Express `app.get`, NestJS `@Controller`, Rails `get`, Spring `@GetMapping`, etc.) linked by `references` to handlers; `callers` of a view surfaces its URL pattern.
+- **Mixed iOS / React Native / Expo bridging** — Swift↔ObjC (`@objc` bridging), RN legacy bridge (`NativeModules`), TurboModules, `sendEventWithName`↔`addListener`, Expo `Module { Name("X") }`, Fabric/Paper view managers — edges tagged `provenance:'heuristic'` + `metadata.synthesizedBy` (e.g. `swift-objc-bridge`, `rn-event-channel`).
+- **`codegraph affected`** — transitive import-dependency tracing to find affected test files from changed sources; ideal for Kage's `TEST` phase to select `cargo test` subset or to enrich `TEST_RESULTS.md` with "tests that should have been run".
+- **Measured cross-file coverage** — fair coverage = share of symbol-bearing files with ≥1 resolved cross-file dependent on a real benchmark repo per language (TS/JS 95.8%, Python 100%, Go 96.6%, Rust 86.7%, etc.) — honest frontier, not gamed.
+
+### 7.6 How Kage Should Implement It (Recommendation)
+
+**Use the upstream CLI directly — same 3 options as §4.4, now with upstream specifics:**
+
+| Option | How | Effort | When |
+|--------|-----|--------|------|
+| **C — Snapshot (today, 0 Rust change)** | `setup.commands: ["codegraph sync --quiet"]` then `Artifacts::read_or_placeholder` reads `.codegraph/snapshot.json` if you emit one, or just rely on CLI at prompt time | 1 hour | Immediate value, already in worktree |
+| **A — CLI subprocess (recommended, 2–3 days)** | `tokio::process::Command::new("codegraph").args([...]).timeout(2s)` — no new crate, no SQLite dep, respects `.codegraph/` location | 2–3 days | Follow-up after C |
+| **B — Direct SQLite (rusqlite, read-only)** | Open `.codegraph/codegraph.db` with `SQLITE_OPEN_READONLY`, query `nodes_fts` + `files` | 2–3 days + dep | Only if subprocess latency matters |
+
+**Preferred CLI invocations for Kage (verified above):**
+
+```rust
+// src/engine/codegraph.rs — new helper, ~60 LOC, read-only, infallible (Option<String>)
+pub fn context_for_task(workdir: &Path, task: &str) -> Option<String> {
+    // 1. codegraph files --json  → file tree (maxDepth 3, cap ~20 files)
+    // 2. codegraph explore <task>  → verbatim source + blast radius (cap 800 tokens, truncate with "… (truncated)")
+    // Both with 2s timeout, None on missing DB/binary/timeout
+}
+pub fn impact_for_diff(workdir: &Path, diff: &str) -> Option<String> {
+    // parse diff "+++ b/<path>" → extract symbols → codegraph impact <symbol> --depth 2 --json
+    // return "## Impact Analysis" markdown: affected files/symbols beyond the diff
+}
+```
+
+Injected in `src/engine/prompts.rs` at the top of each prompt builder (same pattern as §4.2):
+
+| Role | Query | Injected Section |
+|------|-------|------------------|
+| Planner | `codegraph explore <task>` + `codegraph files --json` (tree, maxDepth 3) | `## Codebase Map` — file tree + top hits with `file:line` |
+| Reviewer | `codegraph impact` on symbols from `diff` (`+++ b/` parse) | `## Impact Analysis` — dependents beyond the diff |
+| Fixer | Same as reviewer (diff-scoped) | `## Impact of Current Change` — narrow, keep fix diff small |
+| Executor | `codegraph explore` on plan's `# Files` table | `## Relevant Source` — verbatim blocks for files the plan names |
+| TEST (future) | `codegraph affected <changed files> --stdin --quiet` | Select `cargo test` subset or annotate `TEST_RESULTS.md` |
+
+Token budget: cap injected context to ~800 tokens (5 hits + file tree), truncate deterministically with `… (truncated)`. Wrap in distinct delimiters (`--- CodeGraph ---`) so task text cannot inject `## Verdict`.
+
+**Why CLI over library/MCP for Kage:**
+
+- Kage is a Rust single binary (`cargo install`) — library requires Node 22.5+ in-process, adds `npm:@colbymchenry/codegraph` dep and per-platform package, not justified.
+- MCP is for agents (Claude/Cursor/Codex) — Kage *drives* those agents; it should not itself be an MCP client. The CLI is the harness-agnostic surface that `proc::run` already handles (timeout, heartbeat, stall, Windows `cmd /C` + PATHEXT).
+- `codegraph` is already on PATH here (1.5.0); `preflight::check` pattern can verify it like other harnesses, degrading to `None` (current behavior) when absent — zero risk to loop.
+
+**Configuration (zero-config by default, optional `codegraph.json` at repo root):**
+
+```json
+{ "exclude": ["static/", "**/vendor/**"], "include": ["Tools/"], "deprioritize": ["scripts/", "optional-skills/"], "extensions": {".dota_lua": "lua"} }
+```
+
+Built-in skips: `node_modules`, `vendor`, `dist`, `build`, `target`, `.venv`, `Pods`, `.next`, `>1 MB` files, plus `.gitignore` (honored via git or direct read). `deprioritize` keeps paths indexed but demotes their rank — useful for `scripts/` with generic names (`run`, `status`). No Kage change needed unless custom extensions are used.
+
+**Subagent partitioning (ties to §3 + PRD §7.3):** `codegraph impact --depth 2 --json` returns `nodeCount`/`edgeCount` + `affected[]` with `filePath`. For a task that touches multiple files, run `impact` per candidate symbol, compute disjoint file sets via depth-2 BFS (as in §3.3), and only spawn parallel subagents for disjoint sets — prevents deadlock/overwrite. This is the same heuristic proposed in §3.3, now verified with upstream `impact` output (68 nodes/121 edges for `RunState`).
+
+### 7.7 Risks & Mitigations (Upstream-Specific, Extends §5)
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| **Version drift** — local 1.5.0 vs npm 1.6.0, future schema changes | CLI flags or table layout drift | Prefer CLI/MCP (stable) over raw SQL; check `indexed_with_version` / `indexed_with_extraction_version` (currently 1.5.0 / 24); `codegraph upgrade` to pin |
+| **Daemon lock / WSL2 `/mnt` socket** — MCP `Transport closed`, `database is locked` | `codegraph status` shows `Journal:` ≠ `wal` or daemon fallback | `CODEGRAPH_NO_DAEMON=1` to skip shared server; move project to Linux-native FS (`~/` not `/mnt/c`); `codegraph unlock` for stale lock |
+| **Large repo WAL growth** — `-wal` grows during big index | Disk pressure | Tunables `CODEGRAPH_WAL_VALVE_MB` (soft threshold during index, default max(256 MB, index/4) up to 2 GB) + `CODEGRAPH_WAL_HEAL_MB` (resting 64 MB); `CODEGRAPH_WAL_VALVE_DEBUG=1` |
+| **Stale index vs branch** — DB per-machine, not per-commit | Planner sees wrong files | `codegraph sync` in `setup.commands` or before prompt; helper degrades to `None` if DB mtime < HEAD mtime; watcher auto-sync covers normal edits |
+| **Sharing checkout Windows↔WSL** — lock + SQLite cross-FS unreliable | Corrupt or stale index | `CODEGRAPH_DIR=.codegraph-win` on one side; CodeGraph skips sibling `.codegraph-*` when indexing |
+
+### 7.8 References (Upstream)
+
+- Repo: `https://github.com/colbymchenry/codegraph` — README (install, CLI ref, MCP tools, library, config, troubleshooting), `package.json` (`@colbymchenry/codegraph` 1.6.0), `CHANGELOG.md`, `install.sh`/`install.ps1`
+- Docs site: `https://colbymchenry.github.io/codegraph/` — guides/indexing, MCP server instructions (`src/mcp/server-instructions.ts`)
+- Local verification: `codegraph --help`, `codegraph status`, `codegraph query/explore/node/files/callers/impact/affected --help`, `sqlite3 .codegraph/codegraph.db ".schema"` + `SELECT * FROM project_metadata`, `codegraph explore "how does a run start"`, `codegraph impact "RunState" --depth 2 --json` (all on `algonacci/kage` 27 files, 1.5.0)
+- Existing research: `docs/research/codegraph.md` §§1–6 (local DB schema, Pi tools, prompt injection proposal), `docs/research/pi-harness.md` (AdapterKind::Pi), `docs/research/dag-feasibility.md` (Phase→Graph)
+- Kage integration points: `src/engine/prompts.rs` (planner/executor/reviewer/fixer/account), `src/state/store.rs` (`Artifacts`), `src/adapters/proc.rs` (`proc::run` timeout/heartbeat/Windows), `src/config/schema.rs` (LoopConfig), `src/engine/workflow.rs::run_phases`
