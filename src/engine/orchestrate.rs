@@ -135,6 +135,7 @@ pub async fn run_parallel(
     partitions: &[Partition],
     executor: &dyn AgentAdapter,
     brief: prompts::Brief<'_>,
+    timeout: std::time::Duration,
 ) -> Result<Vec<crate::adapters::AgentResult>> {
     let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
     let futures: Vec<_> = partitions
@@ -150,7 +151,11 @@ pub async fn run_parallel(
             let workdir = workdir.to_path_buf();
             let shard_path = artifacts.subagent_dir(&p.id).join("EXECUTION.md");
             async move {
-                let _ = std::fs::create_dir_all(log_path.parent().unwrap());
+                std::fs::create_dir_all(log_path.parent().unwrap())
+                    .with_context(|| {
+                        format!("cannot create {}", log_path.parent().unwrap().display())
+                    })
+                    .ok();
                 let _ = std::fs::File::create(&log_path);
                 let result = executor
                     .run(AgentRequest {
@@ -173,7 +178,16 @@ pub async fn run_parallel(
         })
         .collect();
 
-    let results = futures::future::join_all(futures).await;
+    // Parent wall-clock timeout bounds join_all — no N×. If timeout fires, all children are
+    // considered failed (bounded kill/reap/drain per child already in proc::run).
+    let results = tokio::time::timeout(timeout, futures::future::join_all(futures))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "subagents timed out after {}s (parent timeout)",
+                timeout.as_secs()
+            )
+        })?;
     let mut out = Vec::new();
     for r in results {
         out.push(r?);
@@ -366,9 +380,16 @@ mod tests {
         }
         let mock = SharedMock;
         let brief = prompts::Brief::Plan;
-        let results = run_parallel(&root, &artifacts, &partitions, &mock, brief)
-            .await
-            .unwrap();
+        let results = run_parallel(
+            &root,
+            &artifacts,
+            &partitions,
+            &mock,
+            brief,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.code == Some(0)));
 

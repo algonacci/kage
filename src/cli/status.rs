@@ -143,7 +143,7 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
         }
         let total: f64 = subagents.iter().filter_map(|s| s.cost_usd).sum();
         if total > 0.0 {
-            let tier = if total < 1.0 {
+            let tier = if total < 3.0 {
                 ""
             } else if total < 5.0 {
                 " (tier 1)"

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// One Kage-spawned child handling a disjoint file partition.
+/// One shard of a partitioned execution — kept separate so a crash doesn't lose all work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentState {
     pub id: String,

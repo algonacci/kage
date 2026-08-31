@@ -19,15 +19,18 @@ fn run_codegraph(workdir: &Path, args: &[&str]) -> Option<String> {
     if !db_present(workdir) {
         return None;
     }
+    // Resolve via proc::resolve_program so Windows .cmd shims (npm) are handled
+    // via PATHEXT + cmd /C, like every other external program in Kage.
+    let resolved = crate::adapters::proc::resolve_program("codegraph").ok()?;
     let workdir = workdir.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let prefix = resolved.prefix_args.clone();
+    let program = resolved.program.clone();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let out = Command::new("codegraph")
-            .args(&args)
-            .arg("--path")
-            .arg(&workdir)
-            .output();
+        let mut cmd = Command::new(&program);
+        cmd.args(&prefix).args(&args).arg("--path").arg(&workdir);
+        let out = cmd.output();
         let _ = tx.send(out);
     });
     match rx.recv_timeout(TIMEOUT) {
@@ -47,12 +50,11 @@ fn truncate(s: &str) -> String {
     }
 }
 
-/// File tree + top hits + blast radius, ~800-token cap.
+/// File tree + hits for the planner — the planner has no RepoMap without it.
 pub fn context_for_task(workdir: &Path, task: &str) -> Option<String> {
     if !db_present(workdir) || task.trim().is_empty() {
         return None;
     }
-    // ponytail: sync call, no async needed for prompt enrichment
     let files_json = run_codegraph(workdir, &["files", "--json"])?;
     let explore = run_codegraph(workdir, &["explore", task.trim()])?;
     let files: Vec<serde_json::Value> = serde_json::from_str(&files_json).unwrap_or_default();
@@ -69,7 +71,7 @@ pub fn context_for_task(workdir: &Path, task: &str) -> Option<String> {
     Some(truncate(&combined))
 }
 
-/// Parses `+++ b/` lines, runs `impact --depth 2 --json` per symbol.
+/// Dependents beyond the diff — the reviewer needs them to judge blast radius.
 pub fn impact_for_diff(workdir: &Path, diff: &str) -> Option<String> {
     if !db_present(workdir) {
         return None;
@@ -114,35 +116,73 @@ pub fn impact_for_diff(workdir: &Path, diff: &str) -> Option<String> {
     Some(truncate(&combined))
 }
 
-/// File sets for a single task via `codegraph explore` — used for partition disjoint check.
+/// Partition disjoint check needs file sets per task — degrade to None when unavailable.
 ///
-/// Returns `None` when DB/binary missing (degrades to sequential fallback).
+/// Uses `explore` to find candidate symbols, then `impact --depth 2 --json` per symbol
+/// to collect disjoint file sets via depth-2 BFS as spec requires.
 pub fn impact_files_for_task(workdir: &Path, task: &str) -> Option<Vec<String>> {
     if !db_present(workdir) || task.trim().is_empty() {
         return None;
     }
-    // Use explore to find relevant symbols, then impact each for file sets
     let explore = run_codegraph(workdir, &["explore", task.trim()])?;
-    // Parse file paths from explore output — look for `src/` mentions
-    let mut files = Vec::new();
+    // Extract candidate symbols from explore output — look for src/ paths as symbol hints
+    let mut candidates = Vec::new();
     for word in explore.split_whitespace() {
-        // Heuristic: extract src/ paths from explore output
         let cleaned = word.trim_matches(|c: char| {
             !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
         });
         if cleaned.starts_with("src/") && cleaned.contains('.') {
-            let path = cleaned.split(':').next().unwrap_or(cleaned);
-            if !files.contains(&path.to_string()) {
-                files.push(path.to_string());
+            let sym = cleaned.split(':').next().unwrap_or(cleaned);
+            // Use file path as symbol for impact — codegraph impact accepts file paths too
+            if !candidates.contains(&sym.to_string()) {
+                candidates.push(sym.to_string());
             }
         }
-        if files.len() >= 5 {
+        if candidates.len() >= 3 {
             break;
         }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    // For each candidate, run impact --depth 2 --json and collect filePaths
+    let mut files = Vec::new();
+    for sym in candidates.iter().take(3) {
+        if let Some(j) = run_codegraph(workdir, &["impact", sym, "--depth", "2", "--json"])
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&j)
+        {
+            // Try affected[].filePath (new shape) or filePaths (old shape)
+            #[allow(clippy::collapsible_if)]
+            if let Some(arr) = v.get("affected").and_then(|a| a.as_array()) {
+                for it in arr {
+                    if let Some(fp) = it.get("filePath").and_then(|v| v.as_str()) {
+                        if !files.contains(&fp.to_string()) {
+                            files.push(fp.to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(arr) = v.get("filePaths").and_then(|a| a.as_array()) {
+                for it in arr {
+                    #[allow(clippy::collapsible_if)]
+                    if let Some(fp) = it.as_str() {
+                        #[allow(clippy::collapsible_if)]
+                        if !files.contains(&fp.to_string()) {
+                            files.push(fp.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: if impact returned nothing, use candidates directly as file hints
+    if files.is_empty() {
+        files = candidates;
     }
     if files.is_empty() {
         return None;
     }
+    files.truncate(10);
     Some(files)
 }
 

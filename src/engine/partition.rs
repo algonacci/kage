@@ -9,14 +9,15 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// One partition of an oversized task.
+/// One partition of an oversized task — split so two executors don't touch the same file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Partition {
     pub id: String,
     pub task: String,
     pub files: Vec<PathBuf>,
 }
-
+/// Oversized tasks must be split — this finds the split the planner already declared.
+///
 /// Parse partitions from PLAN.md.
 ///
 /// Checks in order:

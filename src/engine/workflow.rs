@@ -469,17 +469,20 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                         );
                         for p in &partitions {
                             let dir = artifacts.subagent_dir(&p.id);
-                            let _ = std::fs::create_dir_all(&dir);
+                            std::fs::create_dir_all(&dir).with_context(|| {
+                                format!("cannot create subagent dir {}", dir.display())
+                            })?;
                             let meta = serde_json::json!({
                                 "id": p.id,
                                 "task": p.task,
                                 "files": p.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
                                 "status": "pending"
                             });
-                            let _ = std::fs::write(
+                            std::fs::write(
                                 dir.join("meta.json"),
                                 serde_json::to_string_pretty(&meta).unwrap(),
-                            );
+                            )
+                            .with_context(|| format!("cannot write meta for {}", p.id))?;
                         }
                         if let Some(subs) = &mut state.subagents {
                             for s in subs.iter_mut() {
@@ -487,12 +490,15 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                             }
                         }
                         let brief_val = brief(&state);
+                        let timeout =
+                            std::time::Duration::from_secs(config.roles.executor.timeout_secs);
                         let results = crate::engine::orchestrate::run_parallel(
                             &state.workdir,
                             &artifacts,
                             &partitions,
                             &*executor,
                             brief_val,
+                            timeout,
                         )
                         .await?;
                         // Fail-fast: one subagent FAIL → aggregate FAIL

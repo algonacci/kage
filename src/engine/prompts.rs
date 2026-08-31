@@ -280,6 +280,8 @@ pub fn subagent(
          **Task:** {task}\n\n\
          **Files you may touch:** {files}\n\n\
          Avoid files outside your partition — another subagent owns them.\n\n\
+         If you need to coordinate with other subagents, append to `{discussion}` (append-only, shared).\n\
+         Kage polls this file and relays to others — no separate socket.\n\n\
          {brief_block}\
          ## Rules\n\n\
          - Implement only this partition's task, touching only its files where possible.\n\
@@ -288,6 +290,7 @@ pub fn subagent(
         id = partition.id,
         task = partition.task,
         files = files_list,
+        discussion = artifacts.shared_discussion().display(),
     )
 }
 /// Ask the executor for the account of work it has already finished, and for nothing else.
@@ -400,11 +403,13 @@ pub fn fixer(
 
     // ponytail: CodeGraph impact for fixer — diff-scoped, narrow
     let test_results = artifacts.read_or_placeholder(&artifacts.test_results());
-    let cg_fixer = codegraph::impact_for_diff(workdir, &test_results).unwrap_or_default();
-    let cg_section = if cg_fixer.is_empty() {
+    let cg_raw = codegraph::impact_for_diff(workdir, &test_results).unwrap_or_default();
+    let cg_section = if cg_raw.is_empty() {
         String::new()
     } else {
-        format!("\n{cg_fixer}\n")
+        // Fixer gets narrow scope header, not the reviewer's broader one
+        let narrow = cg_raw.replace("## Impact Analysis", "## Impact of Current Change");
+        format!("\n{narrow}\n")
     };
 
     format!(
