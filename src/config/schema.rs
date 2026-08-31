@@ -281,6 +281,7 @@ pub enum AdapterKind {
     #[serde(rename = "opencode")]
     OpenCode,
     Kamui,
+    Pi,
     Command,
 }
 
@@ -300,8 +301,8 @@ impl AdapterKind {
             // Kamui gates every tool call behind a prompt unless told otherwise.
             Self::Kamui => vec!["--auto-approve".to_string()],
             // OpenCode carries out its own edits in `run` mode with no permission flag, and an API
-            // call has no argv at all.
-            Self::Api | Self::OpenCode | Self::Command => Vec::new(),
+            // call has no argv at all. Pi likewise needs no mandatory permission flags.
+            Self::Api | Self::OpenCode | Self::Pi | Self::Command => Vec::new(),
         }
     }
 }
@@ -314,6 +315,7 @@ impl std::fmt::Display for AdapterKind {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Kamui => "kamui",
+            Self::Pi => "pi",
             Self::Command => "command",
         };
         f.write_str(name)
@@ -645,6 +647,26 @@ mod tests {
         // OpenCode edits without asking, so an invented flag would only break the spawn.
         assert!(
             RoleConfig::preset(AdapterKind::OpenCode)
+                .resolved_extra_args()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pi_adapter_displays_as_pi_and_round_trips_through_serde() {
+        assert_eq!(AdapterKind::Pi.to_string(), "pi");
+        let yaml = serde_yaml_ng::to_string(&AdapterKind::Pi).unwrap();
+        assert!(yaml.contains("pi"));
+        let back: AdapterKind = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(back, AdapterKind::Pi);
+        let from_yaml: AdapterKind = serde_yaml_ng::from_str("pi").unwrap();
+        assert_eq!(from_yaml, AdapterKind::Pi);
+    }
+
+    #[test]
+    fn pi_needs_no_mandatory_permission_flags() {
+        assert!(
+            RoleConfig::preset(AdapterKind::Pi)
                 .resolved_extra_args()
                 .is_empty()
         );

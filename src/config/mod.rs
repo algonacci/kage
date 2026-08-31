@@ -374,7 +374,7 @@ mod tests {
             format!("run_{date}_042"),
             format!("feature/run_{date}_042"),
             format!("kage/run_{date}_notanumber"),
-            format!("kage/run_19700101_099"),
+            "kage/run_19700101_099".to_string(),
         ];
 
         assert_eq!(
