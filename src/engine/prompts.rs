@@ -4,9 +4,9 @@
 //! different harnesses with three different context windows cannot share a conversation, and an
 //! artifact on disk survives a crash, gets read by `kage status`, and can be inspected after the
 //! fact. So each prompt is assembled from files and stands entirely on its own.
-
 use std::path::Path;
 
+use crate::engine::codegraph;
 use crate::engine::gates::Verdict;
 use crate::state::{Artifacts, FixCause};
 
@@ -74,6 +74,13 @@ impl Delivery {
 /// A vague plan pushes design decisions down to the weakest model in the loop, which is exactly
 /// backwards from the premise that expensive reasoning should happen once, up front.
 pub fn planner(task: &str, workdir: &Path, artifacts: &Artifacts, delivery: Delivery) -> String {
+    // ponytail: CodeGraph read-only, infallible — None degrades to current behavior
+    let cg = codegraph::context_for_task(workdir, task).unwrap_or_default();
+    let cg_section = if cg.is_empty() {
+        String::new()
+    } else {
+        format!("\n{cg}\n")
+    };
     format!(
         "{}\
          Your job is to produce an implementation plan. You are the most capable model in this \
@@ -82,6 +89,7 @@ pub fn planner(task: &str, workdir: &Path, artifacts: &Artifacts, delivery: Deli
          edge cases, and what must not change.\n\n\
          Do not implement anything. Read the repository as much as you need first.\n\n\
          ## Task\n\n{task}\n\n\
+         {cg_section}\
          {}\
          ## Required structure\n\n\
          ```markdown\n\
@@ -136,7 +144,6 @@ pub enum Brief<'a> {
     Request { task: &'a str },
 }
 
-/// Ask the executor to implement the plan as written, or the request when no plan exists.
 pub fn executor(
     workdir: &Path,
     artifacts: &Artifacts,
@@ -150,6 +157,31 @@ pub fn executor(
         "a summary of the work you did",
     );
 
+    // ponytail: CodeGraph read-only — None degrades to no enrichment
+    let cg_exec = match &brief {
+        Brief::Plan => {
+            let plan_text = artifacts.read_or_placeholder(&artifacts.plan());
+            // Extract file names from plan's # Files table for targeted explore
+            let files_hint = plan_text
+                .lines()
+                .filter(|l| l.contains("src/") || l.contains(".rs"))
+                .take(5)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if files_hint.is_empty() {
+                String::new()
+            } else {
+                codegraph::context_for_task(workdir, &files_hint).unwrap_or_default()
+            }
+        }
+        Brief::Request { task } => codegraph::context_for_task(workdir, task).unwrap_or_default(),
+    };
+    let cg_section = if cg_exec.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Relevant Source\n\n{cg_exec}\n")
+    };
+
     match brief {
         Brief::Plan => format!(
             "{}\
@@ -158,6 +190,7 @@ pub fn executor(
              ## The plan\n\n\
              The full plan is at `{}`. Read it first. Its contents follow.\n\n\
              ---\n\n{}\n\n---\n\n\
+             {cg_section}\
              ## Rules\n\n\
              - Implement this plan exactly.\n\
              - Do not redesign the architecture unless implementing it as written is impossible.\n\
@@ -182,6 +215,7 @@ pub fn executor(
              that satisfies the task.\n\n\
              {}\
              ## Task\n\n{}\n\n\
+             {cg_section}\
              ## Rules\n\n\
              - Read the repository before you change it, and follow the conventions already in it.\n\
              - Implement the task as written. Keep the change as small as the task allows; do not \
@@ -261,15 +295,6 @@ pub struct FixAttempt {
     pub budget: usize,
 }
 
-/// Ask the executor to repair specific findings.
-///
-/// The fix prompt names the findings rather than restating the whole task, because a rewrite is a
-/// new chance to break what already passed. Narrow instructions produce narrow diffs.
-///
-/// The cause changes the framing, not the structure. Telling an executor its work "was reviewed
-/// and rejected" when no reviewer ever saw it invents an authority the loop does not have — and an
-/// agent told to fix review findings hunts for findings, while one told the build broke reads the
-/// test output.
 pub fn fixer(
     workdir: &Path,
     artifacts: &Artifacts,
@@ -316,12 +341,22 @@ pub fn fixer(
         ),
     };
 
+    // ponytail: CodeGraph impact for fixer — diff-scoped, narrow
+    let test_results = artifacts.read_or_placeholder(&artifacts.test_results());
+    let cg_fixer = codegraph::impact_for_diff(workdir, &test_results).unwrap_or_default();
+    let cg_section = if cg_fixer.is_empty() {
+        String::new()
+    } else {
+        format!("\n{cg_fixer}\n")
+    };
+
     format!(
         "{}\
          {intro}\n\n\
          {}\
          {findings_header}\n\n{}\n\n\
          ## Test results from the last run\n\n{}\n\n\
+         {cg_section}\
          {}\
          ## Rules\n\n\
          - Fix exactly these findings. Do not refactor unrelated code.\n\
@@ -336,7 +371,7 @@ pub fn fixer(
             "a summary of the fixes you made",
         ),
         verdict.issues_markdown(),
-        artifacts.read_or_placeholder(&artifacts.test_results()),
+        test_results,
         brief_block,
     )
 }
@@ -398,6 +433,14 @@ pub fn reviewer(
         ),
     };
 
+    // ponytail: CodeGraph impact for reviewer — dependents beyond the diff
+    let cg_reviewer = codegraph::impact_for_diff(workdir, diff).unwrap_or_default();
+    let cg_section = if cg_reviewer.is_empty() {
+        String::new()
+    } else {
+        format!("\n{cg_reviewer}\n")
+    };
+
     format!(
         "{}\
          {intro}\n\n\
@@ -406,6 +449,7 @@ pub fn reviewer(
          ## What the executor reported\n\n---\n\n{}\n\n---\n\n\
          ## Automated test results\n\n---\n\n{}\n\n---\n\n\
          ## Changes made\n\n---\n\n{diff}\n\n---\n\n\
+         {cg_section}\
          ## What to check\n\n{checks}\n\
          Judge what the code does, not what the executor says it does.\n\n\
          ## Verdict\n\n\
