@@ -94,6 +94,9 @@ fn preset_template(kind: AdapterKind, model: Option<&str>) -> Vec<String> {
         AdapterKind::OpenCode => vec!["opencode".into(), "run".into()],
         // Verified against Kamui's own argument parser: `kamui -p <prompt> [--auto-approve]`.
         AdapterKind::Kamui => vec!["kamui".into(), "-p".into()],
+        // ponytail: PiJson streaming deferred — pi --mode json NDJSON schema not yet stable.
+        // Passthrough keeps the raw log readable without a twin progress file.
+        AdapterKind::Pi => vec!["pi".into(), "-p".into()],
         // Reached only through a `command:` override; an API role never builds a CliAdapter.
         AdapterKind::Api | AdapterKind::Command => Vec::new(),
     };
@@ -102,6 +105,7 @@ fn preset_template(kind: AdapterKind, model: Option<&str>) -> Vec<String> {
         let flag = match kind {
             AdapterKind::ClaudeCode => Some("--model"),
             AdapterKind::Codex | AdapterKind::OpenCode => Some("-m"),
+            AdapterKind::Pi => Some("--model"),
             // Kamui picks its model from its own config; there is no per-invocation flag.
             AdapterKind::Kamui | AdapterKind::Api | AdapterKind::Command => None,
         };
@@ -462,6 +466,7 @@ mod tests {
             AdapterKind::Codex,
             AdapterKind::OpenCode,
             AdapterKind::Kamui,
+            AdapterKind::Pi,
         ] {
             let plain = adapter(&RoleConfig::preset(kind));
             assert_eq!(
@@ -478,6 +483,7 @@ mod tests {
             AdapterKind::Codex,
             AdapterKind::OpenCode,
             AdapterKind::Kamui,
+            AdapterKind::Pi,
         ] {
             let argv = rendered(&RoleConfig::preset(kind), "x");
             assert_eq!(
@@ -513,5 +519,42 @@ mod tests {
         ];
 
         assert_eq!(output_format(&argv), stream::OutputFormat::ClaudeStreamJson);
+    }
+
+    #[test]
+    fn pi_preset_uses_pi_dash_p_and_model_flag() {
+        let mut with_model = RoleConfig::preset(AdapterKind::Pi);
+        with_model.model = Some("opus-5".into());
+        let argv = rendered(&with_model, "x");
+        assert_eq!(argv[0], "pi");
+        assert_eq!(argv[1], "-p");
+        assert!(argv.contains(&"--model".to_string()));
+        assert!(argv.contains(&"opus-5".to_string()));
+
+        let without_model = RoleConfig::preset(AdapterKind::Pi);
+        let argv2 = rendered(&without_model, "x");
+        assert_eq!(argv2, vec!["pi", "-p", argv2.last().unwrap().as_str()]);
+        assert!(!argv2.contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn pi_adapter_uses_passthrough_and_file_delivery() {
+        let config = RoleConfig::preset(AdapterKind::Pi);
+        assert_eq!(config.prompt_delivery, PromptDelivery::File);
+        let argv = rendered(&config, "x");
+        assert_eq!(output_format(&argv), stream::OutputFormat::Passthrough);
+        let mut custom = RoleConfig::preset(AdapterKind::Pi);
+        custom.command = Some(vec!["pi".into(), "-p".into(), "{prompt}".into()]);
+        let argv2 = rendered(&custom, "x");
+        assert_eq!(argv2[0], "pi");
+    }
+
+    #[test]
+    fn command_override_takes_precedence_over_pi_preset() {
+        let mut config = RoleConfig::preset(AdapterKind::Pi);
+        config.command = Some(vec!["pi".into(), "-p".into(), "{prompt}".into()]);
+        let argv = rendered(&config, "hello");
+        assert_eq!(argv[0], "pi");
+        assert!(argv.iter().any(|a| a.contains("/tmp/p.md") || a == "hello"));
     }
 }

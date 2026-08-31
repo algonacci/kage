@@ -80,6 +80,21 @@ pub async fn stat(workdir: &Path, base_commit: &str) -> Result<String> {
     .to_string())
 }
 
+/// File names only, for post-join overlap detection.
+pub async fn name_only(workdir: &Path, base_commit: &str) -> Result<String> {
+    let _ = git::git(workdir, &["add", "--intent-to-add", "--", "."]).await;
+    let out = git::git(
+        workdir,
+        &[
+            &["diff", "--name-only", base_commit, "--", "."][..],
+            EXCLUDE_KAGE,
+        ]
+        .concat(),
+    )
+    .await?;
+    Ok(out)
+}
+
 fn truncate(diff: &str) -> String {
     if diff.len() <= MAX_DIFF_CHARS {
         return diff.to_string();

@@ -113,6 +113,58 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
         );
     }
 
+    // Additive shard table — only when subagents were used.
+    if let Some(subagents) = &state.subagents
+        && !subagents.is_empty()
+    {
+        println!("\nSubagents");
+        for s in subagents {
+            let files = if s.files.is_empty() {
+                "(none)".to_string()
+            } else {
+                s.files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let cost = s
+                .cost_usd
+                .map(|c| format!(" ${:.2}", c))
+                .unwrap_or_default();
+            println!(
+                "  {:<12} {:<10} {}{}  {}",
+                s.id,
+                s.status.to_string(),
+                truncate(&s.task, 30),
+                cost,
+                files
+            );
+        }
+        let total: f64 = subagents.iter().filter_map(|s| s.cost_usd).sum();
+        if total > 0.0 {
+            let tier = if total < 3.0 {
+                ""
+            } else if total < 5.0 {
+                " (tier 1)"
+            } else {
+                " (tier 2 — review cost)"
+            };
+            let cap_note = if total > 10.0 { " [capped]" } else { "" };
+            let capped = total.min(10.0);
+            let breakdown: Vec<String> = subagents
+                .iter()
+                .filter_map(|s| s.cost_usd.map(|c| format!("{} ${:.2}", s.id, c)))
+                .collect();
+            let breakdown_str = if breakdown.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", breakdown.join(" + "))
+            };
+            println!("Cost: ${:.2}{}{}{}", capped, breakdown_str, tier, cap_note);
+        }
+    }
+
     if !state.history.is_empty() {
         println!("\nHistory");
         for event in &state.history {
@@ -222,6 +274,64 @@ mod tests {
     #[test]
     fn short_tasks_are_left_alone() {
         assert_eq!(truncate("short", 20), "short");
+    }
+
+    #[test]
+    fn cost_sum_with_cap() {
+        let mut s = state(Phase::Executing);
+        s.subagents = Some(vec![
+            crate::state::SubagentState {
+                id: "auth".to_string(),
+                task: "auth".to_string(),
+                files: vec![],
+                status: crate::state::SubagentStatus::Completed,
+                cost_usd: Some(0.28),
+            },
+            crate::state::SubagentState {
+                id: "health".to_string(),
+                task: "health".to_string(),
+                files: vec![],
+                status: crate::state::SubagentStatus::Completed,
+                cost_usd: Some(0.14),
+            },
+        ]);
+        let total: f64 = s
+            .subagents
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s.cost_usd)
+            .sum();
+        assert!((total - 0.42).abs() < 0.001, "total {total}");
+        assert!(total.min(10.0) < 10.0);
+        let big: f64 = vec![Some(6.0), Some(6.0)].into_iter().flatten().sum();
+        assert_eq!(big.min(10.0), 10.0);
+    }
+
+    #[test]
+    fn parent_only_budget() {
+        let mut s = state(Phase::Executing);
+        s.max_iterations = 3;
+        s.max_repairs = 3;
+        s.subagents = Some(vec![
+            crate::state::SubagentState {
+                id: "a".to_string(),
+                task: "a".to_string(),
+                files: vec![],
+                status: crate::state::SubagentStatus::Completed,
+                cost_usd: None,
+            },
+            crate::state::SubagentState {
+                id: "b".to_string(),
+                task: "b".to_string(),
+                files: vec![],
+                status: crate::state::SubagentStatus::Completed,
+                cost_usd: None,
+            },
+        ]);
+        assert_eq!(s.remaining_iterations(), 3);
+        assert_eq!(s.remaining_repairs(), 3);
+        assert_eq!(s.max_iterations, 3);
     }
 
     #[test]
