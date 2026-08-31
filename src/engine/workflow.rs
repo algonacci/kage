@@ -522,6 +522,18 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                                 s.status = crate::state::SubagentStatus::Completed;
                             }
                         }
+                        // Post-join overlap detection: fail-fast if git diff shows same file touched by 2 partitions
+                        if let Some(base) = &state.base_commit
+                            && let Ok(diff_files) =
+                                crate::git::diff::name_only(&state.workdir, base).await
+                            && let Some(overlap) =
+                                crate::engine::orchestrate::overlap_from_diff_output(
+                                    &diff_files,
+                                    &partitions,
+                                )
+                        {
+                            return fail(project, state, overlap);
+                        }
                         crate::engine::orchestrate::aggregate_shards(&artifacts, &partitions)?;
                         // Ensure aggregate has content
                         if !artifacts.has_content(&artifacts.execution()) {

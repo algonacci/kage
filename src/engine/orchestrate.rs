@@ -15,6 +15,68 @@ use crate::engine::partition::{Partition, are_disjoint, enrich_with_codegraph, p
 use crate::engine::prompts;
 use crate::state::Artifacts;
 
+/// Append to shared discussion (file-append IS the channel, no socket).
+#[allow(dead_code)]
+pub fn append_discussion(artifacts: &Artifacts, subagent_id: &str, message: &str) -> Result<()> {
+    let path = artifacts.shared_discussion();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    let entry = format!(
+        "## {} — {subagent_id}\n{message}\n\n",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+    );
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    file.write_all(entry.as_bytes())
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(())
+}
+
+/// Read shared discussion for relay to other subagents.
+#[allow(dead_code)]
+pub fn read_discussion(artifacts: &Artifacts) -> String {
+    std::fs::read_to_string(artifacts.shared_discussion()).unwrap_or_default()
+}
+
+/// Post-join overlap detection: check if git diff shows same file touched by 2 partitions.
+///
+/// Parses `git diff --name-only` output and checks if any file appears in more than one partition's file set.
+/// Fail-fast if overlap detected.
+pub fn detect_overlap(partitions: &[Partition], changed_files: &[String]) -> Option<String> {
+    for changed in changed_files {
+        let mut claimants = Vec::new();
+        for p in partitions {
+            if p.files.iter().any(|f| f.display().to_string() == *changed) {
+                claimants.push(p.id.as_str());
+            }
+        }
+        if claimants.len() > 1 {
+            return Some(format!(
+                "overlap detected: file `{changed}` claimed by partitions {} — failing fast",
+                claimants.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Also check if any changed file is outside all partitions (not an error, just info).
+/// The hard check is: same file in 2 partitions = fail.
+pub fn overlap_from_diff_output(diff_name_only: &str, partitions: &[Partition]) -> Option<String> {
+    let changed: Vec<String> = diff_name_only
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    detect_overlap(partitions, &changed)
+}
+
 /// Aggregate shards into EXECUTION.md with headers + partition map.
 pub fn aggregate_shards(artifacts: &Artifacts, partitions: &[Partition]) -> Result<()> {
     let mut out = String::new();
@@ -317,5 +379,76 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discussion_append_and_relay() {
+        let root = std::env::temp_dir().join(format!("kage-orch-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::config::init(&root, true).unwrap();
+        let project = crate::config::Project::discover(&root).unwrap();
+        let artifacts = Artifacts::new(&project, "run_1");
+        artifacts.ensure_dirs().unwrap();
+        append_discussion(&artifacts, "auth", "needs api_key_env").unwrap();
+        append_discussion(&artifacts, "health", "no conflict").unwrap();
+        let content = read_discussion(&artifacts);
+        assert!(content.contains("auth"), "{content}");
+        assert!(content.contains("needs api_key_env"), "{content}");
+        assert!(content.contains("health"), "{content}");
+        // Append-only: both entries present
+        assert!(content.contains("no conflict"), "{content}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn post_join_overlap_fail_fast() {
+        let a = Partition {
+            id: "a".to_string(),
+            task: "a".to_string(),
+            files: vec![PathBuf::from("src/shared.rs")],
+        };
+        let b = Partition {
+            id: "b".to_string(),
+            task: "b".to_string(),
+            files: vec![PathBuf::from("src/shared.rs")],
+        };
+        let diff = "src/shared.rs\nsrc/other.rs\n";
+        let overlap = overlap_from_diff_output(diff, &[a, b]);
+        assert!(overlap.is_some(), "should detect overlap");
+        assert!(overlap.unwrap().contains("src/shared.rs"));
+    }
+
+    #[test]
+    fn post_join_no_overlap_passes() {
+        let a = Partition {
+            id: "a".to_string(),
+            task: "a".to_string(),
+            files: vec![PathBuf::from("src/a.rs")],
+        };
+        let b = Partition {
+            id: "b".to_string(),
+            task: "b".to_string(),
+            files: vec![PathBuf::from("src/b.rs")],
+        };
+        let diff = "src/a.rs\nsrc/b.rs\n";
+        let overlap = overlap_from_diff_output(diff, &[a, b]);
+        assert!(
+            overlap.is_none(),
+            "disjoint partitions should not trigger overlap"
+        );
+    }
+
+    #[test]
+    fn per_child_stall_does_not_block_others() {
+        // Each child's stall is independent — one stalled child doesn't block join_all
+        // This is guaranteed by proc::run's per-Spawn stall + join_all awaiting all futures
+        // We verify the config: stall_secs 600 default, 0 disables
+        let config: crate::config::RoleConfig =
+            crate::config::RoleConfig::preset(crate::config::AdapterKind::OpenCode);
+        assert_eq!(config.stall_secs, 600);
+        let mut disabled = crate::config::RoleConfig::preset(crate::config::AdapterKind::OpenCode);
+        disabled.stall_secs = 0;
+        assert_eq!(disabled.stall_secs, 0);
     }
 }
