@@ -437,7 +437,13 @@ mod tests {
     #[test]
     fn run_state_with_subagents_round_trips() {
         let mut state = RunState::new("run_1".to_string(), "t".to_string(), PathBuf::from("."), 3);
-        state.subagents = Some(vec![crate::state::SubagentState { id: "auth".to_string(), task: "add auth".to_string(), files: vec![PathBuf::from("src/auth.rs")], status: crate::state::SubagentStatus::Completed, cost_usd: Some(0.12) }]);
+        state.subagents = Some(vec![crate::state::SubagentState {
+            id: "auth".to_string(),
+            task: "add auth".to_string(),
+            files: vec![PathBuf::from("src/auth.rs")],
+            status: crate::state::SubagentStatus::Completed,
+            cost_usd: Some(0.12),
+        }]);
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("subagents"));
         let back: RunState = serde_json::from_str(&json).unwrap();

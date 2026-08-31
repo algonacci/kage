@@ -215,19 +215,28 @@ impl Artifacts {
         self.dir.join("logs")
     }
 
+    #[allow(dead_code)]
     pub fn subagent_dir(&self, id: &str) -> PathBuf {
         self.dir.join("subagents").join(id)
     }
 
+    #[allow(dead_code)]
     pub fn shared_discussion(&self) -> PathBuf {
         self.dir.join("shared/discussion.md")
     }
 
     // ponytail: simple concat — no abstraction, just headers + file content.
+    #[allow(dead_code)]
     pub fn collect_shards(&self) -> Result<String> {
         let subagents_root = self.dir.join("subagents");
-        if !subagents_root.is_dir() { return Ok(String::new()); }
-        let mut entries: Vec<String> = std::fs::read_dir(&subagents_root)?.filter_map(|e| e.ok()).filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        if !subagents_root.is_dir() {
+            return Ok(String::new());
+        }
+        let mut entries: Vec<String> = std::fs::read_dir(&subagents_root)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
         entries.sort();
         let mut out = String::new();
         if !entries.is_empty() {
@@ -235,8 +244,26 @@ impl Artifacts {
             out.push_str("| Subagent | Files |\n|---|---|\n");
             for id in &entries {
                 let meta_path = subagents_root.join(id).join("meta.json");
-                let files = std::fs::read_to_string(&meta_path).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()).and_then(|v| v.get("files").cloned()).map(|v| v.as_array().map(|arr| arr.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()).unwrap_or_default();
-                let files = if files.is_empty() { "(none)".to_string() } else { files };
+                let files = std::fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    .and_then(|v| v.get("files").cloned())
+                    .map(|v| {
+                        v.as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            })
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let files = if files.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    files
+                };
                 out.push_str(&format!("| {id} | {files} |\n"));
             }
             out.push('\n');
@@ -244,7 +271,9 @@ impl Artifacts {
         for id in &entries {
             let shard = subagents_root.join(id).join("EXECUTION.md");
             let content = std::fs::read_to_string(&shard).unwrap_or_default();
-            if content.trim().is_empty() { continue; }
+            if content.trim().is_empty() {
+                continue;
+            }
             out.push_str(&format!("## Subagent {id}\n\n"));
             out.push_str(content.trim());
             out.push_str("\n\n");
@@ -634,14 +663,20 @@ mod tests {
     fn subagent_dir_is_under_artifacts() {
         let (root, project) = project("subagent-dir");
         let artifacts = Artifacts::new(&project, "run_1");
-        assert_eq!(artifacts.subagent_dir("auth"), project.run_dir("run_1").join("subagents/auth"));
+        assert_eq!(
+            artifacts.subagent_dir("auth"),
+            project.run_dir("run_1").join("subagents/auth")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
     fn shared_discussion_is_under_artifacts() {
         let (root, project) = project("shared-disc");
         let artifacts = Artifacts::new(&project, "run_1");
-        assert_eq!(artifacts.shared_discussion(), project.run_dir("run_1").join("shared/discussion.md"));
+        assert_eq!(
+            artifacts.shared_discussion(),
+            project.run_dir("run_1").join("shared/discussion.md")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
@@ -649,7 +684,10 @@ mod tests {
         let (root, project) = project("collect");
         let artifacts = Artifacts::new(&project, "run_1");
         artifacts.ensure_dirs().unwrap();
-        for (id, content, files) in [("auth", "did auth", r#"["src/auth.rs"]"#), ("health", "did health", r#"["src/health.rs"]"#)] {
+        for (id, content, files) in [
+            ("auth", "did auth", r#"["src/auth.rs"]"#),
+            ("health", "did health", r#"["src/health.rs"]"#),
+        ] {
             let dir = artifacts.subagent_dir(id);
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("EXECUTION.md"), content).unwrap();

@@ -6,4 +6,5 @@ pub mod subagent;
 
 pub use run::{Commitment, FixCause, Phase, RunState, Worktree};
 pub use store::Artifacts;
+#[allow(unused_imports)]
 pub use subagent::{SubagentState, SubagentStatus};
