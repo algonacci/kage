@@ -113,6 +113,36 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
         );
     }
 
+    // Additive shard table — only when subagents were used.
+    if let Some(subagents) = &state.subagents
+        && !subagents.is_empty()
+    {
+        println!("\nSubagents");
+        for s in subagents {
+            let files = if s.files.is_empty() {
+                "(none)".to_string()
+            } else {
+                s.files
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let cost = s
+                .cost_usd
+                .map(|c| format!(" ${:.2}", c))
+                .unwrap_or_default();
+            println!(
+                "  {:<12} {:<10} {}{}  {}",
+                s.id,
+                s.status.to_string(),
+                truncate(&s.task, 30),
+                cost,
+                files
+            );
+        }
+    }
+
     if !state.history.is_empty() {
         println!("\nHistory");
         for event in &state.history {

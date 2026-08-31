@@ -49,6 +49,7 @@ pub fn program_for(config: &RoleConfig) -> String {
         AdapterKind::Codex => "codex".to_string(),
         AdapterKind::OpenCode => "opencode".to_string(),
         AdapterKind::Kamui => "kamui".to_string(),
+        AdapterKind::Pi => "pi".to_string(),
         // Not a program on PATH at all: the provider name is what identifies this role.
         AdapterKind::Api => config
             .provider
@@ -256,6 +257,7 @@ mod tests {
             AdapterKind::Codex,
             AdapterKind::OpenCode,
             AdapterKind::Kamui,
+            AdapterKind::Pi,
         ] {
             let role_config = RoleConfig::preset(kind);
             let program = program_for(&role_config);

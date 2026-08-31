@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::gates::Verdict;
+use crate::state::subagent::SubagentState;
 
 /// Where a run is in the workflow.
 ///
@@ -212,6 +213,9 @@ pub struct RunState {
     pub resume_from: Option<Phase>,
     #[serde(default)]
     pub history: Vec<Event>,
+    // ponytail: additive field — None when no subagents, no new Phase variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<Vec<SubagentState>>,
 }
 
 /// The repair budget a state file gets when it predates the field, and `new` starts from before
@@ -244,6 +248,7 @@ impl RunState {
             error: None,
             resume_from: None,
             history: Vec::new(),
+            subagents: None,
         }
     }
 
@@ -411,5 +416,45 @@ mod tests {
             .describe(),
             "not committed: git died"
         );
+    }
+
+    #[test]
+    fn a_state_file_written_before_subagents_still_loads() {
+        let json = r#"{
+            "id": "run_1",
+            "task": "add caching",
+            "created_at": "2026-08-09T00:00:00Z",
+            "updated_at": "2026-08-09T00:00:00Z",
+            "phase": "completed",
+            "iteration": 0,
+            "max_iterations": 3,
+            "workdir": "."
+        }"#;
+        let state: RunState = serde_json::from_str(json).unwrap();
+        assert!(state.subagents.is_none());
+    }
+
+    #[test]
+    fn run_state_with_subagents_round_trips() {
+        let mut state = RunState::new("run_1".to_string(), "t".to_string(), PathBuf::from("."), 3);
+        state.subagents = Some(vec![crate::state::SubagentState {
+            id: "auth".to_string(),
+            task: "add auth".to_string(),
+            files: vec![PathBuf::from("src/auth.rs")],
+            status: crate::state::SubagentStatus::Completed,
+            cost_usd: Some(0.12),
+        }]);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("subagents"));
+        let back: RunState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.subagents.as_ref().unwrap().len(), 1);
+        assert_eq!(back.subagents.as_ref().unwrap()[0].id, "auth");
+    }
+
+    #[test]
+    fn run_state_without_subagents_omits_field() {
+        let state = RunState::new("run_1".to_string(), "t".to_string(), PathBuf::from("."), 3);
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("subagents"));
     }
 }
