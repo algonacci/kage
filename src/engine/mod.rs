@@ -2,6 +2,8 @@
 
 pub mod codegraph;
 pub mod gates;
+pub mod orchestrate;
+pub mod partition;
 pub mod prompts;
 pub mod runner;
 pub mod workflow;

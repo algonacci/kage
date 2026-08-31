@@ -114,6 +114,38 @@ pub fn impact_for_diff(workdir: &Path, diff: &str) -> Option<String> {
     Some(truncate(&combined))
 }
 
+/// File sets for a single task via `codegraph explore` — used for partition disjoint check.
+///
+/// Returns `None` when DB/binary missing (degrades to sequential fallback).
+pub fn impact_files_for_task(workdir: &Path, task: &str) -> Option<Vec<String>> {
+    if !db_present(workdir) || task.trim().is_empty() {
+        return None;
+    }
+    // Use explore to find relevant symbols, then impact each for file sets
+    let explore = run_codegraph(workdir, &["explore", task.trim()])?;
+    // Parse file paths from explore output — look for `src/` mentions
+    let mut files = Vec::new();
+    for word in explore.split_whitespace() {
+        // Heuristic: extract src/ paths from explore output
+        let cleaned = word.trim_matches(|c: char| {
+            !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+        });
+        if cleaned.starts_with("src/") && cleaned.contains('.') {
+            let path = cleaned.split(':').next().unwrap_or(cleaned);
+            if !files.contains(&path.to_string()) {
+                files.push(path.to_string());
+            }
+        }
+        if files.len() >= 5 {
+            break;
+        }
+    }
+    if files.is_empty() {
+        return None;
+    }
+    Some(files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

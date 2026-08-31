@@ -233,6 +233,63 @@ pub fn executor(
     }
 }
 
+/// Prompt for a single subagent partition.
+///
+/// Narrow: only this partition's task + its file list. The subagent must avoid
+/// files outside its partition — hard disjoint check already passed, this is
+/// the soft prompt reinforcement.
+pub fn subagent(
+    workdir: &Path,
+    artifacts: &Artifacts,
+    partition: &crate::engine::partition::Partition,
+    brief: Brief<'_>,
+    delivery: Delivery,
+) -> String {
+    let preamble = preamble("executor", workdir);
+    let shard_path = artifacts.subagent_dir(&partition.id).join("EXECUTION.md");
+    let deliverable = deliverable(
+        delivery,
+        &shard_path,
+        "a summary of the work you did for this partition",
+    );
+    let files_list = if partition.files.is_empty() {
+        "(no file restriction — work on the task as described)".to_string()
+    } else {
+        partition
+            .files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let brief_block = match brief {
+        Brief::Plan => format!(
+            "## The plan this partition implements\n\n---\n\n{}\n\n---\n\n",
+            artifacts.read_or_placeholder(&artifacts.plan())
+        ),
+        Brief::Request { task } => format!(
+            "## The task this partition implements\n\nNo plan was written; this task is the whole specification.\n\n---\n\n{task}\n\n---\n\n"
+        ),
+    };
+    format!(
+        "{preamble}\
+         You are a subagent handling one partition of a larger task. Implement only this partition.\n\n\
+         {deliverable}\
+         ## Your partition\n\n\
+         **Id:** `{id}`\n\n\
+         **Task:** {task}\n\n\
+         **Files you may touch:** {files}\n\n\
+         Avoid files outside your partition — another subagent owns them.\n\n\
+         {brief_block}\
+         ## Rules\n\n\
+         - Implement only this partition's task, touching only its files where possible.\n\
+         - Do not redesign architecture outside your scope.\n\
+         - Write the account of what you changed for this partition.\n",
+        id = partition.id,
+        task = partition.task,
+        files = files_list,
+    )
+}
 /// Ask the executor for the account of work it has already finished, and for nothing else.
 ///
 /// Every agent invocation is a fresh process with no memory, so this cannot say "you forgot the

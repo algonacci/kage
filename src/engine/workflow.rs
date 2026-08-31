@@ -442,9 +442,106 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 // A previous attempt's account must not be mistaken for this one's — the same
                 // reason the review phase deletes a stale VERDICT.json before re-running.
                 let _ = std::fs::remove_file(artifacts.execution());
+                // Try subagent partitioning: Deferred Tasks or explicit Partition: in PLAN.md
+                // plus codegraph impact --depth 2 disjoint check. Disjoint → parallel via
+                // tokio::join_all + proc::run per subagent; overlap → fallback sequential.
+                // Single worktree, one base_commit, one git diff aggregate.
+                let try_partitions =
+                    crate::engine::orchestrate::try_parse_partitions(&artifacts, &state.workdir);
+                if let Some(partitions) = try_partitions {
+                    if crate::engine::orchestrate::should_parallelize(&partitions) {
+                        println!(
+                            "  subagents: {} partitions (disjoint) — parallel",
+                            partitions.len()
+                        );
+                        // Record subagent states
+                        state.subagents = Some(
+                            partitions
+                                .iter()
+                                .map(|p| crate::state::SubagentState {
+                                    id: p.id.clone(),
+                                    task: p.task.clone(),
+                                    files: p.files.clone(),
+                                    status: crate::state::SubagentStatus::Pending,
+                                    cost_usd: None,
+                                })
+                                .collect(),
+                        );
+                        for p in &partitions {
+                            let dir = artifacts.subagent_dir(&p.id);
+                            let _ = std::fs::create_dir_all(&dir);
+                            let meta = serde_json::json!({
+                                "id": p.id,
+                                "task": p.task,
+                                "files": p.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+                                "status": "pending"
+                            });
+                            let _ = std::fs::write(
+                                dir.join("meta.json"),
+                                serde_json::to_string_pretty(&meta).unwrap(),
+                            );
+                        }
+                        if let Some(subs) = &mut state.subagents {
+                            for s in subs.iter_mut() {
+                                s.status = crate::state::SubagentStatus::Running;
+                            }
+                        }
+                        let brief_val = brief(&state);
+                        let results = crate::engine::orchestrate::run_parallel(
+                            &state.workdir,
+                            &artifacts,
+                            &partitions,
+                            &*executor,
+                            brief_val,
+                        )
+                        .await?;
+                        // Fail-fast: one subagent FAIL → aggregate FAIL
+                        let mut any_failed = false;
+                        for r in &results {
+                            if let Some(reason) = agent_failure(r, "executor") {
+                                any_failed = true;
+                                println!("  subagent failed: {reason}");
+                            }
+                        }
+                        if any_failed {
+                            if let Some(subs) = &mut state.subagents {
+                                for s in subs.iter_mut() {
+                                    s.status = crate::state::SubagentStatus::Failed(
+                                        "subagent failure".to_string(),
+                                    );
+                                }
+                            }
+                            return fail(
+                                project,
+                                state,
+                                "a subagent failed — see logs/subagent-*.log".to_string(),
+                            );
+                        }
+                        if let Some(subs) = &mut state.subagents {
+                            for s in subs.iter_mut() {
+                                s.status = crate::state::SubagentStatus::Completed;
+                            }
+                        }
+                        crate::engine::orchestrate::aggregate_shards(&artifacts, &partitions)?;
+                        // Ensure aggregate has content
+                        if !artifacts.has_content(&artifacts.execution()) {
+                            return fail(
+                                project,
+                                state,
+                                "subagents completed but produced no EXECUTION.md aggregate — check subagent logs".to_string(),
+                            );
+                        }
+                        state.transition(Phase::Testing, "subagent implementations finished");
+                        continue;
+                    }
+                    println!(
+                        "  partitions overlap or lack file info — falling back to single executor"
+                    );
+                }
 
                 let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
-                let prompt = prompts::executor(&state.workdir, &artifacts, brief(&state), delivery);
+                let brief_val = brief(&state);
+                let prompt = prompts::executor(&state.workdir, &artifacts, brief_val, delivery);
 
                 let result = run_agent(&*executor, &state, &artifacts, "executor", prompt).await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
