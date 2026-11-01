@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod engine;
 mod git;
+mod notify;
 mod paths;
 mod state;
 

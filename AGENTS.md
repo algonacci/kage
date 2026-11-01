@@ -54,6 +54,7 @@ src/
 ├── config/
 │   ├── mod.rs           project discovery, kage init, starter config
 │   └── schema.rs        serde shapes for .kage/config.yaml
+├── notify.rs            the webhook POST when a run stops; never changes the outcome
 └── paths.rs             path normalisation shared by anything handing a path to another program
 ```
 
@@ -131,6 +132,15 @@ invited to tail is `<label>.progress.log`: the terminal's rendered lines, stderr
 and how the run ended. Only a streaming backend gets one (`AgentAdapter::progress_log`); for a
 passthrough harness the raw log is already readable and a twin would leave two identical files and
 a user guessing which to trust.
+
+**A stopped run is announced by a plain webhook, not a messaging integration.** A run left
+unattended ends in a terminal nobody is reading, so `notify:` POSTs JSON with a `text` field when a
+run completes, fails, blocks, or dies on an error before reaching a terminal phase — that last case
+surfaces as an `Err` with no final state, and it is exactly the overnight run that would otherwise
+end in silence. Telegram or Slack delivery is the receiver's business, which keeps chat out of Kage
+(see Positioning). The secret travels in a header the config must name, because receivers disagree
+and a guessed name fails as a 401 only after the run has been paid for. A failed notification is a
+printed warning and never touches the exit code: the run is over and its state is on disk.
 
 **Validation runs in Kage's process, never inside an agent.** An agent reporting "tests pass" is a
 claim. An exit code is evidence.

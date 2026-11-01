@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::config::{self, Project};
+use crate::config::{self, Config, Project};
 use crate::engine::workflow::{self, Options};
-use crate::state::{Commitment, Phase, RunState, store};
+use crate::notify;
+use crate::state::{Artifacts, Commitment, Phase, RunState, store};
 
 /// `kage init` — scaffold `.kage/` in the current directory.
 pub fn init(cwd: &Path, force: bool) -> Result<()> {
@@ -69,8 +70,21 @@ pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
         ),
     }
 
-    let state = workflow::start(&project, &config, task, &options).await?;
+    let state = match workflow::start(&project, &config, task, &options).await {
+        Ok(state) => state,
+        Err(error) => {
+            notify::announce_error(
+                config.notify.as_ref(),
+                &project_name(&project),
+                None,
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     report(&state);
+    announce(&project, &config, &state).await;
 
     exit_for(&state)
 }
@@ -88,10 +102,51 @@ pub async fn resume(cwd: &Path, run_id: Option<&str>) -> Result<()> {
 
     println!("Resuming {} from `{}`", state.id, state.phase);
 
-    let state = workflow::resume(&project, &config, state).await?;
+    let run_id = state.id.clone();
+    let state = match workflow::resume(&project, &config, state).await {
+        Ok(state) => state,
+        Err(error) => {
+            notify::announce_error(
+                config.notify.as_ref(),
+                &project_name(&project),
+                Some(&run_id),
+                &error,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     report(&state);
+    announce(&project, &config, &state).await;
 
     exit_for(&state)
+}
+
+/// Tell the configured webhook how a run ended.
+///
+/// Runs after the closing summary so a slow receiver never delays what the terminal shows, and
+/// before the exit code so a script chaining runs knows the message has gone.
+async fn announce(project: &Project, config: &Config, state: &RunState) {
+    let deferred = std::fs::read_to_string(Artifacts::new(project, &state.id).plan())
+        .ok()
+        .and_then(|plan| workflow::deferred_tasks(&plan));
+
+    notify::announce(
+        config.notify.as_ref(),
+        &project_name(project),
+        state,
+        deferred.as_deref(),
+    )
+    .await;
+}
+
+/// The repository's directory name — what a person juggling several repos recognises.
+fn project_name(project: &Project) -> String {
+    project
+        .root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| project.root.display().to_string())
 }
 
 /// `kage clean` — reclaim the disk that finished runs are holding.

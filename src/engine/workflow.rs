@@ -804,7 +804,7 @@ async fn ensure_account(
 /// The header match tolerates `##` and case drift because models produce both, but the section
 /// ends at the next heading of any depth: relaying too much would bury the message this exists
 /// to surface.
-fn deferred_tasks(plan: &str) -> Option<String> {
+pub(crate) fn deferred_tasks(plan: &str) -> Option<String> {
     let is_deferred_heading = |line: &str| {
         let trimmed = line.trim();
         trimmed.starts_with('#')

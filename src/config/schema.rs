@@ -33,6 +33,10 @@ pub struct Config {
     pub setup: Setup,
     #[serde(default)]
     pub validation: Validation,
+    /// Where to announce that a run stopped. Absent means nobody is told, which is right for a run
+    /// someone is watching and wrong for one left going overnight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<Notify>,
 }
 
 fn default_version() -> u32 {
@@ -237,8 +241,92 @@ impl Config {
             }
         }
 
+        if let Some(notify) = &self.notify {
+            notify.validate()?;
+        }
+
         Ok(())
     }
+}
+
+/// A webhook told when a run stops.
+///
+/// Deliberately a plain HTTP POST and nothing more specific. Chat delivery belongs to whatever sits
+/// behind the URL — a Telegram bot, a Slack relay — so Kage carries no messaging integration of its
+/// own and any receiver that accepts JSON will do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Notify {
+    pub url: String,
+    /// Name of the environment variable holding the shared secret, never the secret itself — for
+    /// the same reason as [`Provider::api_key_env`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_env: Option<String>,
+    /// The header the secret travels in. Required alongside `secret_env` rather than defaulted:
+    /// receivers disagree on the name, and a guessed one fails as a 401 at the end of a long run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_header: Option<String>,
+    /// Which endings are worth a message.
+    #[serde(default = "default_notify_on")]
+    pub on: Vec<NotifyEvent>,
+    /// Static JSON merged into every body, for whatever the receiver wants that Kage cannot know: a
+    /// chat id, or `parse_mode: null` to stop a Markdown parser choking on the underscores in a run
+    /// id. Kage's own keys win a collision so a stray field cannot replace the message.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, serde_json::Value>,
+    #[serde(default = "default_notify_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_notify_on() -> Vec<NotifyEvent> {
+    vec![
+        NotifyEvent::Completed,
+        NotifyEvent::Failed,
+        NotifyEvent::Blocked,
+    ]
+}
+
+/// Short, because the run is already over and the only thing left waiting is the exit code.
+fn default_notify_timeout() -> u64 {
+    10
+}
+
+impl Notify {
+    fn validate(&self) -> Result<(), String> {
+        let url = self.url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(format!(
+                "`notify.url` must be an http:// or https:// URL, got `{}`",
+                self.url
+            ));
+        }
+
+        match (&self.secret_env, &self.secret_header) {
+            (Some(_), None) => Err(
+                "`notify.secret_env` is set but `notify.secret_header` is not\n\
+                 name the header the receiver reads the secret from, e.g. `X-Notify-Secret`"
+                    .to_string(),
+            ),
+            (None, Some(_)) => Err(
+                "`notify.secret_header` is set but `notify.secret_env` is not\n\
+                 name the environment variable that holds the secret"
+                    .to_string(),
+            ),
+            _ if self.timeout_secs == 0 => {
+                Err("`notify.timeout_secs` must be greater than zero".to_string())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// The run endings a webhook can subscribe to. One per terminal phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyEvent {
+    Completed,
+    Failed,
+    Blocked,
 }
 
 /// One API endpoint.
@@ -624,6 +712,80 @@ mod tests {
         let error = serde_yaml_ng::from_str::<Config>("loop:\n  max_iteration: 1\n").unwrap_err();
 
         assert!(error.to_string().contains("max_iteration"));
+    }
+
+    #[test]
+    fn a_notify_block_defaults_to_every_ending_and_a_short_timeout() {
+        let config: Config =
+            serde_yaml_ng::from_str("notify:\n  url: https://example.test/notify\n").unwrap();
+
+        let notify = config.notify.as_ref().unwrap();
+        assert_eq!(
+            notify.on,
+            vec![
+                NotifyEvent::Completed,
+                NotifyEvent::Failed,
+                NotifyEvent::Blocked
+            ]
+        );
+        assert_eq!(notify.timeout_secs, 10);
+        assert!(config.validate().is_ok());
+        assert!(
+            serde_yaml_ng::from_str::<Config>("{}")
+                .unwrap()
+                .notify
+                .is_none(),
+            "no block means nobody is told"
+        );
+    }
+
+    #[test]
+    fn a_notify_secret_and_its_header_come_as_a_pair() {
+        // Defaulting the header would turn a wrong guess into a 401 discovered only when a long run
+        // ends and its message never arrives.
+        let base = "notify:\n  url: https://example.test/notify\n";
+
+        let env_only: Config =
+            serde_yaml_ng::from_str(&format!("{base}  secret_env: S\n")).unwrap();
+        let error = env_only.validate().unwrap_err();
+        assert!(error.contains("secret_header"), "{error}");
+        assert!(
+            error.contains("X-Notify-Secret"),
+            "the remedy names an example: {error}"
+        );
+
+        let header_only: Config =
+            serde_yaml_ng::from_str(&format!("{base}  secret_header: X\n")).unwrap();
+        assert!(header_only.validate().unwrap_err().contains("secret_env"));
+
+        let both: Config =
+            serde_yaml_ng::from_str(&format!("{base}  secret_env: S\n  secret_header: X\n"))
+                .unwrap();
+        assert!(both.validate().is_ok());
+    }
+
+    #[test]
+    fn a_notify_url_must_be_http() {
+        let config: Config = serde_yaml_ng::from_str("notify:\n  url: beepbot.local\n").unwrap();
+
+        assert!(config.validate().unwrap_err().contains("http://"));
+    }
+
+    #[test]
+    fn an_explicit_null_field_survives_parsing() {
+        // `parse_mode: null` is how a Telegram relay is told to send plain text; dropping the null
+        // would let its Markdown default choke on the underscores in every run id.
+        let config: Config = serde_yaml_ng::from_str(
+            "notify:\n  url: https://example.test/\n  fields:\n    parse_mode: null\n",
+        )
+        .unwrap();
+
+        let fields = &config.notify.unwrap().fields;
+        assert!(
+            fields
+                .get("parse_mode")
+                .is_some_and(|value| value.is_null())
+        );
     }
 
     #[test]

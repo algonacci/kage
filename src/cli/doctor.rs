@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Result;
 
 use crate::adapters::{preflight, proc};
-use crate::config::{AdapterKind, Config, Project, RoleConfig};
+use crate::config::{AdapterKind, Config, Notify, Project, RoleConfig};
 
 const CHECK: &str = "\u{2713}";
 const CROSS: &str = "\u{2717}";
@@ -81,6 +81,13 @@ pub async fn run(cwd: &Path) -> Result<()> {
         println!();
     }
 
+    // Never a required item: a run without a webhook still runs. But a secret that is not exported
+    // is only discovered when the run ends and the message silently does not arrive.
+    if let Some(notify) = config.as_ref().and_then(|config| config.notify.as_ref()) {
+        let (mark, detail) = notify_status(notify);
+        println!("Notify\n{mark} {}\n    {detail}\n", notify.url);
+    }
+
     println!("Harnesses");
     for (program, install) in KNOWN_HARNESSES {
         report_optional(program, install);
@@ -129,6 +136,33 @@ fn api_role_status(config: &Config, role: &RoleConfig) -> (&'static str, String)
         ),
         Ok(_) => (CROSS, format!("${} is set but empty", provider.api_key_env)),
         Err(_) => (CROSS, format!("${} is not set", provider.api_key_env)),
+    }
+}
+
+/// Whether the webhook could authenticate, checked for presence only, like an API key.
+fn notify_status(notify: &Notify) -> (&'static str, String) {
+    let events = notify
+        .on
+        .iter()
+        .map(|event| format!("{event:?}").to_lowercase())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match &notify.secret_env {
+        None => (CHECK, format!("on {events} · no secret")),
+        Some(name) => match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => {
+                (CHECK, format!("on {events} · ${name} is set"))
+            }
+            Ok(_) => (
+                CROSS,
+                format!("${name} is set but empty — messages will be skipped"),
+            ),
+            Err(_) => (
+                CROSS,
+                format!("${name} is not set — messages will be skipped"),
+            ),
+        },
     }
 }
 

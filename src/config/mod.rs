@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 pub use schema::{
-    AdapterKind, Config, PromptDelivery, Provider, RoleConfig, Roles, Setup, Validation,
+    AdapterKind, Config, Notify, NotifyEvent, PromptDelivery, Provider, RoleConfig, Roles, Setup,
+    Validation,
 };
 
 /// Directory name that marks a Kage project, mirroring `.git`.
@@ -223,7 +224,18 @@ fn starter_config(root: &Path) -> String {
          # Exit codes, not agent self-reports, decide whether execution succeeded.\n\
          validation:\n\
          {rendered}\
-         \x20 timeout_secs: 900\n"
+         \x20 timeout_secs: 900\n\
+         \n\
+         # Be told when an unattended run stops: a JSON POST with a `text` field.\n\
+         # The secret is read from the named environment variable, never written here.\n\
+         #\n\
+         # notify:\n\
+         #   url: https://example.com/notify\n\
+         #   secret_env: KAGE_NOTIFY_SECRET\n\
+         #   secret_header: X-Notify-Secret\n\
+         #   on: [completed, failed, blocked]\n\
+         #   fields:              # merged into every body, e.g. for a chat relay\n\
+         #     parse_mode: null\n"
     )
 }
 
@@ -374,7 +386,7 @@ mod tests {
             format!("run_{date}_042"),
             format!("feature/run_{date}_042"),
             format!("kage/run_{date}_notanumber"),
-            format!("kage/run_19700101_099"),
+            "kage/run_19700101_099".to_string(),
         ];
 
         assert_eq!(
