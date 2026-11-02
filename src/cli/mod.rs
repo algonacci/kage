@@ -11,8 +11,8 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{self, Config, Project};
 use crate::engine::workflow::{self, Options};
-use crate::notify;
 use crate::state::{Artifacts, Commitment, Phase, RunState, store};
+use crate::{finish, notify};
 
 /// `kage init` — scaffold `.kage/` in the current directory.
 pub fn init(cwd: &Path, force: bool) -> Result<()> {
@@ -73,13 +73,16 @@ pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
     }
 
     let state = start(&project, &config, task, &options).await?;
+    let hand_over = finish::for_run(&project, &state);
+    conclude(&project, &config, &state, hand_over.as_ref()).await;
     exit_for(&state)
 }
 
-/// Start a run and see it through to its summary and its notification.
+/// Start a run and see it through to its closing summary; the caller then concludes it.
 ///
-/// Shared by `kage run` and the queue so a queued ticket is reported and announced exactly as a
-/// typed one would be — the queue adds order, never a second way of finishing a run.
+/// Shared by `kage run` and the queue so a queued ticket is reported exactly as a typed one would
+/// be — the queue adds order, never a second way of finishing a run. Concluding is the caller's
+/// because only the caller knows whether this run's branch is the one to hand over.
 pub(crate) async fn start(
     project: &Project,
     config: &Config,
@@ -95,8 +98,26 @@ pub(crate) async fn start(
         }
     };
     report(&state);
-    announce(project, config, &state).await;
     Ok(state)
+}
+
+/// Hand the work over, when there is a branch to hand over, then tell the configured webhook.
+///
+/// Hand-over first, so the notification can carry the pull request it opened — the one link the
+/// person reading it on a phone wants next.
+pub(crate) async fn conclude(
+    project: &Project,
+    config: &Config,
+    state: &RunState,
+    hand_over: Option<&finish::HandOver>,
+) {
+    let handed_over = match hand_over {
+        Some(hand_over) => {
+            finish::hand_over(&config.finish, project, &project_name(project), hand_over).await
+        }
+        None => None,
+    };
+    announce(project, config, state, handed_over.as_deref()).await;
 }
 
 /// `kage resume [run_id]` — continue an interrupted run.
@@ -127,7 +148,14 @@ pub async fn resume(cwd: &Path, run_id: Option<&str>) -> Result<()> {
         }
     };
     report(&state);
-    announce(&project, &config, &state).await;
+    // A queued ticket with a later sibling is not handed over: the next ticket stacks on its
+    // branch, and the session's pull request comes from the last one.
+    let hand_over = match queue::hand_over_for(&project, &state) {
+        queue::Place::NotQueued => finish::for_run(&project, &state),
+        queue::Place::Stacked => None,
+        queue::Place::Tip(hand_over) => hand_over,
+    };
+    conclude(&project, &config, &state, hand_over.as_ref()).await;
 
     exit_for(&state)
 }
@@ -136,7 +164,7 @@ pub async fn resume(cwd: &Path, run_id: Option<&str>) -> Result<()> {
 ///
 /// Runs after the closing summary so a slow receiver never delays what the terminal shows, and
 /// before the exit code so a script chaining runs knows the message has gone.
-async fn announce(project: &Project, config: &Config, state: &RunState) {
+async fn announce(project: &Project, config: &Config, state: &RunState, handed_over: Option<&str>) {
     let deferred = std::fs::read_to_string(Artifacts::new(project, &state.id).plan())
         .ok()
         .and_then(|plan| workflow::deferred_tasks(&plan));
@@ -146,6 +174,7 @@ async fn announce(project: &Project, config: &Config, state: &RunState) {
         &project_name(project),
         state,
         deferred.as_deref(),
+        handed_over,
     )
     .await;
 }

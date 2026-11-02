@@ -40,7 +40,12 @@ pub fn event_for(phase: Phase) -> Option<NotifyEvent> {
 /// The project is named because one machine drives runs in several repositories, and a run id alone
 /// does not say which. `deferred` is relayed on completion because a planner that split the task
 /// left work nobody has started yet — the one thing a finished run still wants from its owner.
-pub fn message(project: &str, state: &RunState, deferred: Option<&str>) -> String {
+pub fn message(
+    project: &str,
+    state: &RunState,
+    deferred: Option<&str>,
+    handed_over: Option<&str>,
+) -> String {
     let mut lines = Vec::new();
 
     let headline = match (state.phase, state.resume_from) {
@@ -63,6 +68,14 @@ pub fn message(project: &str, state: &RunState, deferred: Option<&str>) -> Strin
     if let Some(commit) = &state.commit {
         lines.push(String::new());
         lines.push(commit.describe());
+    }
+
+    // The pull request a finish command opened is the link the reader taps next.
+    if let Some(handed_over) = handed_over {
+        lines.push(format!(
+            "Handed over: {}",
+            truncate(handed_over.trim(), 300)
+        ));
     }
 
     if state.phase == Phase::Completed
@@ -191,11 +204,12 @@ pub async fn announce(
     project: &str,
     state: &RunState,
     deferred: Option<&str>,
+    handed_over: Option<&str>,
 ) {
     let Some(event) = event_for(state.phase) else {
         return;
     };
-    let text = message(project, state, deferred);
+    let text = message(project, state, deferred, handed_over);
     deliver(notify, event, project, &RunFacts::of(state), &text).await;
 }
 
@@ -330,7 +344,7 @@ mod tests {
         state.resume_from = Some(Phase::Testing);
         state.error = Some("validation failed: cargo test exited 101".to_string());
 
-        let text = message("kage", &state, None);
+        let text = message("kage", &state, None, None);
 
         assert!(
             text.starts_with("kage · kage · run_20261101_001 failed (during testing)"),
@@ -358,7 +372,7 @@ mod tests {
             created: true,
         });
 
-        let text = message("kage", &state, Some("- add queue\n- add Linear sync"));
+        let text = message("kage", &state, Some("- add queue\n- add Linear sync"), None);
 
         assert!(text.contains("kage/run_20261101_001"), "{text}");
         assert!(text.contains("- add Linear sync"), "{text}");
@@ -368,9 +382,23 @@ mod tests {
     fn deferred_work_is_not_relayed_for_a_run_that_did_not_finish() {
         // A failed run's deferred list describes work after a piece that never landed; listing it
         // as "start these next" would send the reader to build on nothing.
-        let text = message("kage", &state(Phase::Failed), Some("- add queue"));
+        let text = message("kage", &state(Phase::Failed), Some("- add queue"), None);
 
         assert!(!text.contains("add queue"), "{text}");
+    }
+
+    #[test]
+    fn a_completed_message_carries_the_pull_request_the_finish_command_opened() {
+        let text = message(
+            "kage",
+            &state(Phase::Completed),
+            None,
+            Some("https://github.com/o/r/pull/12"),
+        );
+        assert!(
+            text.contains("Handed over: https://github.com/o/r/pull/12"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -378,7 +406,7 @@ mod tests {
         let mut state = state(Phase::Failed);
         state.error = Some("gagal 🚧 ".repeat(2000));
 
-        let text = message("kage", &state, None);
+        let text = message("kage", &state, None, None);
 
         assert!(
             text.chars().count() <= MAX_MESSAGE_CHARS + 1,

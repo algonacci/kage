@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 
 use crate::config::{Config, NotifyEvent, Project};
 use crate::engine::workflow::Options;
+use crate::finish::{self, HandOver};
 use crate::notify;
 use crate::queue::{self, Ledger, QueuedTicket, Standing};
 use crate::shape;
@@ -91,6 +92,11 @@ pub async fn run(cwd: &Path, options: QueueOptions) -> Result<()> {
             Ok(state) => {
                 ledger.record(&ticket.name, &state.id);
                 ledger.save(&project)?;
+                let hand_over = match hand_over_for(&project, &state) {
+                    Place::Tip(hand_over) => hand_over,
+                    Place::NotQueued | Place::Stacked => None,
+                };
+                super::conclude(&project, &config, &state, hand_over.as_ref()).await;
                 if state.phase != Phase::Completed {
                     return stop(
                         &project,
@@ -197,6 +203,84 @@ async fn stop(
     bail!("the queue stopped at {}", ticket.name)
 }
 
+/// Where a finished run sits in the queue, which decides whether its branch is handed over.
+pub(crate) enum Place {
+    /// Not a queued ticket's run: hand it over on its own.
+    NotQueued,
+    /// A later ticket in its session stacks on this branch, so handing it over now would open a
+    /// pull request the next ticket immediately outdates.
+    Stacked,
+    /// The session's last ticket: its branch holds the whole session. `None` when there is
+    /// nothing committed to hand over.
+    Tip(Option<HandOver>),
+}
+
+/// Find the run's ticket through the ledger and decide its [`Place`].
+///
+/// Shared by the queue and `kage resume`, because the run that completes a session is as often a
+/// stopped ticket resumed by hand as one the queue finished.
+pub(crate) fn hand_over_for(project: &Project, state: &RunState) -> Place {
+    let (Ok(ledger), Ok(tickets)) = (
+        Ledger::load(project),
+        queue::discover(&shape::tickets_dir(project)),
+    ) else {
+        return Place::NotQueued;
+    };
+    let Some(ticket) = tickets
+        .iter()
+        .find(|ticket| ledger.latest(&ticket.name) == Some(state.id.as_str()))
+    else {
+        return Place::NotQueued;
+    };
+
+    let siblings: Vec<&QueuedTicket> = tickets
+        .iter()
+        .filter(|other| other.group == ticket.group)
+        .collect();
+    if siblings.iter().any(|other| other.number > ticket.number) {
+        return Place::Stacked;
+    }
+
+    let load = |id: &str| store::load(project, id).ok();
+    let done: Vec<(String, RunState)> = siblings
+        .iter()
+        .filter_map(
+            |sibling| match queue::standing(&ledger, &sibling.name, load) {
+                Standing::Done { run_id, .. } => {
+                    load(&run_id).map(|state| (finish::title_of(&ticket_title(sibling)), state))
+                }
+                _ => None,
+            },
+        )
+        .collect();
+    Place::Tip(finish::for_session(
+        project,
+        session_title(project, &ticket.group),
+        &done,
+    ))
+}
+
+/// The ticket's own first line — `T2: Approval flow` — read from its task file.
+fn ticket_title(ticket: &QueuedTicket) -> String {
+    std::fs::read_to_string(&ticket.path).unwrap_or_else(|_| ticket.name.clone())
+}
+
+/// The PRD's title when the session still exists, the session's slug otherwise.
+fn session_title(project: &Project, group: &str) -> String {
+    std::fs::read_to_string(shape::sessions_dir(project).join(group).join("PRD.md"))
+        .ok()
+        .and_then(|prd| {
+            prd.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("# ")
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+        })
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| group.to_string())
+}
+
 fn headline(project: &Project, ran: usize) -> String {
     format!(
         "kage · {} · queue: {ran} ticket(s) completed this time",
@@ -243,5 +327,71 @@ fn describe(ticket: &QueuedTicket, standing: &Standing) -> String {
             phase.as_str(),
             ticket.name
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Commitment;
+
+    fn committed(project: &Project, id: &str) -> RunState {
+        let mut state = RunState::new(
+            id.to_string(),
+            "task".to_string(),
+            std::path::PathBuf::from("."),
+            3,
+        );
+        state.phase = Phase::Completed;
+        state.commit = Some(Commitment::Committed {
+            sha: "abc".to_string(),
+            branch: format!("kage/{id}"),
+            files_changed: 1,
+            created: true,
+        });
+        store::save(project, &state).unwrap();
+        state
+    }
+
+    #[test]
+    fn only_the_last_ticket_of_a_session_is_handed_over_and_it_carries_the_session() {
+        // A pull request per ticket would be outdated by the next ticket stacking on its branch;
+        // the session's last branch holds everything, so that is the one handed over.
+        let root = std::env::temp_dir().join(format!("kage-queue-place-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::config::init(&root, true).unwrap();
+        let project = Project::discover(&root).unwrap();
+
+        let tickets = shape::tickets_dir(&project);
+        std::fs::create_dir_all(&tickets).unwrap();
+        std::fs::write(tickets.join("leave-t1.md"), "# T1: Table\n").unwrap();
+        std::fs::write(tickets.join("leave-t2.md"), "# T2: Approval\n").unwrap();
+        let session = shape::sessions_dir(&project).join("leave");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("PRD.md"), "# Leave requests\n\nbody").unwrap();
+
+        let first = committed(&project, "run_1");
+        let second = committed(&project, "run_2");
+        let unrelated = committed(&project, "run_9");
+        let mut ledger = Ledger::default();
+        ledger.record("leave-t1.md", "run_1");
+        ledger.record("leave-t2.md", "run_2");
+        ledger.save(&project).unwrap();
+
+        assert!(matches!(hand_over_for(&project, &first), Place::Stacked));
+        assert!(matches!(
+            hand_over_for(&project, &unrelated),
+            Place::NotQueued
+        ));
+        let Place::Tip(Some(hand_over)) = hand_over_for(&project, &second) else {
+            panic!("the session's last ticket must be handed over");
+        };
+        assert_eq!(hand_over.branch, "kage/run_2");
+        assert_eq!(hand_over.title, "Leave requests");
+        assert!(hand_over.summary.contains("## T1: Table"));
+        assert!(hand_over.summary.contains("## T2: Approval"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

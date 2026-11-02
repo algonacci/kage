@@ -39,6 +39,9 @@ pub struct Config {
     pub notify: Option<Notify>,
     #[serde(default)]
     pub shape: ShapeConfig,
+    /// Commands that hand finished work over — push the branch, open a pull request.
+    #[serde(default)]
+    pub finish: Finish,
 }
 
 /// What `kage shape` may show the shaper beyond the repository.
@@ -633,9 +636,50 @@ impl Default for Setup {
     }
 }
 
+/// Commands run once a run's work is committed and nothing will be stacked on it.
+///
+/// Kage stops at a branch on purpose — pushing and opening a pull request need the owner's
+/// credentials, which Kage never holds. These commands are the owner's own tools (`git push`,
+/// `gh pr create`) run with the run's facts in `KAGE_*` environment variables, so a morning's review
+/// starts from a pull request rather than from hunting for `kage/run_…` branches. The facts travel
+/// as environment, never substituted into the command text: a task title is free text, and pasting
+/// it into a shell line would execute whatever it happened to contain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Finish {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default = "default_finish_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_finish_timeout() -> u64 {
+    300
+}
+
+/// Hand-written like [`Setup`]: an omitted `finish:` block still gets the documented timeout.
+impl Default for Finish {
+    fn default() -> Self {
+        Self {
+            commands: Vec::new(),
+            timeout_secs: default_finish_timeout(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_omitted_finish_block_runs_nothing_and_keeps_its_timeout() {
+        let config: Config = serde_yaml_ng::from_str("{}").unwrap();
+        assert!(config.finish.commands.is_empty());
+        assert_eq!(config.finish.timeout_secs, 300);
+
+        let config: Config = serde_yaml_ng::from_str("finish:\n  commands: [\"true\"]\n").unwrap();
+        assert_eq!(config.finish.timeout_secs, 300);
+    }
 
     #[test]
     fn empty_config_falls_back_to_the_documented_defaults() {

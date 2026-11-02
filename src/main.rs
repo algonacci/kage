@@ -11,6 +11,7 @@ mod adapters;
 mod cli;
 mod config;
 mod engine;
+mod finish;
 mod git;
 mod notify;
 mod paths;

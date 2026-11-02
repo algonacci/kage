@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 pub use schema::{
-    AdapterKind, Config, Notify, NotifyEvent, PromptDelivery, Provider, RoleConfig, Roles, Setup,
-    ShapeConfig, Validation,
+    AdapterKind, Config, Finish, Notify, NotifyEvent, PromptDelivery, Provider, RoleConfig, Roles,
+    Setup, ShapeConfig, Validation,
 };
 
 /// Directory name that marks a Kage project, mirroring `.git`.
@@ -235,7 +235,17 @@ fn starter_config(root: &Path) -> String {
          #   secret_header: X-Notify-Secret\n\
          #   on: [completed, failed, blocked]\n\
          #   fields:              # merged into every body, e.g. for a chat relay\n\
-         #     parse_mode: null\n"
+         #     parse_mode: null\n\
+         \n\
+         # Hand finished work over with your own tools once a run's branch holds it.\n\
+         # Run in the project root with KAGE_BRANCH, KAGE_TITLE, KAGE_SUMMARY_FILE,\n\
+         # KAGE_RUN_ID, KAGE_RUN_DIR and KAGE_PROJECT set. The last line a command\n\
+         # prints (a pull request URL) is relayed in the notification.\n\
+         #\n\
+         # finish:\n\
+         #   commands:\n\
+         #     - git push -u origin \"$KAGE_BRANCH\"\n\
+         #     - gh pr create --head \"$KAGE_BRANCH\" --title \"$KAGE_TITLE\" --body-file \"$KAGE_SUMMARY_FILE\"\n"
     )
 }
 

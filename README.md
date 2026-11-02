@@ -129,6 +129,23 @@ does not complete; `kage resume <run_id>` and then `kage queue` carry on from th
 worked which ticket is kept in `.kage/tickets/queue.json`, and with `notify:` configured each run
 announces itself and the queue sends one message when it drains or stops.
 
+### Handing work over
+
+```yaml
+finish:
+  commands:
+    - git push -u origin "$KAGE_BRANCH"
+    - gh pr create --head "$KAGE_BRANCH" --title "$KAGE_TITLE" --body-file "$KAGE_SUMMARY_FILE"
+```
+
+Once a run completes with committed work, these run in the project root with `KAGE_BRANCH`,
+`KAGE_TITLE`, `KAGE_SUMMARY_FILE` (a `HANDOVER.md` built from what each run says it did),
+`KAGE_RUN_ID`, `KAGE_RUN_DIR`, and `KAGE_PROJECT` set — your own tools and your own credentials,
+since Kage holds none. In a queue only a session's last ticket is handed over: its branch holds the
+whole session, so the session becomes one pull request. The last line the commands print (the PR
+URL, from `gh`) is included in the notification. A failing command is a warning; the run's result
+and exit code are unchanged. On Windows, refer to the variables as `%KAGE_BRANCH%`.
+
 ## Configuration
 
 Roles are bound to harnesses in `.kage/config.yaml`. The workflow never names a model.

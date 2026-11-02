@@ -66,6 +66,7 @@ src/
 │   ├── mod.rs           project discovery, kage init, starter config
 │   └── schema.rs        serde shapes for .kage/config.yaml
 ├── notify.rs            the webhook POST when a run stops; never changes the outcome
+├── finish.rs            finish.commands: hand a completed branch over with the owner's own tools
 ├── shape.rs             shaping sessions on disk, the reply envelope, tickets and their export
 ├── queue.rs             ticket order, the ticket → run ledger, and which branch a ticket stacks on
 └── paths.rs             path normalisation shared by anything handing a path to another program
@@ -190,6 +191,21 @@ ahead: later tickets in the session were written against its work, and the remed
 then `kage queue` — continues the existing attempt rather than starting a second one beside it.
 `.kage/tickets/queue.json` records only which run worked which ticket; how it ended is read from
 run state each time, so a resume done by hand is never contradicted by a stale copy.
+
+**Work is handed over by the owner's commands, once per branch nobody stacks on.** A run ends at
+a branch on purpose: pushing and opening a pull request need credentials, and Kage owns none.
+`finish.commands` runs the owner's own tools (`git push`, `gh pr create`) in the project root after
+a completed run committed work, so a morning's review starts from a pull request instead of a hunt
+for `kage/run_…` branches. The run's facts reach the commands as `KAGE_*` environment variables,
+never substituted into the command line — a title is free text from a task, and pasting it into a
+shell line would run whatever it contained. A queued ticket with a later sibling is never handed
+over (the next ticket stacks on it and would outdate the pull request at once); the session's last
+ticket is, carrying a `HANDOVER.md` that accounts for every ticket — and it is handed over even when
+it changed nothing itself, because its branch still holds the commits under it. `kage resume`
+applies the same rule through the ledger, since a session is as often finished by a resumed ticket
+as by the queue. Hand-over runs before the notification so the message can carry the last line the
+commands printed (`gh pr create` prints the URL), and like a notification it is a warning when it
+fails, never an exit code: the work is committed either way.
 
 **Validation runs in Kage's process, never inside an agent.** An agent reporting "tests pass" is a
 claim. An exit code is evidence.
