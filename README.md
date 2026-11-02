@@ -51,6 +51,12 @@ whether the project is ready.
 | `kage resume [run_id]` | Continue an interrupted run |
 | `kage clean [--all]` | Remove worktree checkouts of finished runs (branches are kept; a run whose work was never committed is kept unless `--all` is passed) |
 | `kage doctor` | Check which tools are available |
+| `kage shape new "<idea>" [--chat]` | Start a shaping session: talk an idea into `PRD.md` and tickets |
+| `kage shape say <slug> "<message>"` | One shaping turn (what a messaging gateway calls) |
+| `kage shape chat <slug>` | Shape in a terminal loop (`/show`, `/export`, `/exit`) |
+| `kage shape show <slug>` / `list` | Where a session stands / every session |
+| `kage shape export <slug>` | Write each ready ticket to `.kage/tickets/` as a task file |
+| `kage queue [--list] [--base REF]` | Run the exported tickets one after another |
 
 `kage run` exits non-zero when a run does not complete, so it chains into scripts and CI.
 
@@ -92,6 +98,36 @@ summarising what it changed in `EXECUTION.md`, and the reviewer judges the work 
 task. TEST, REVIEW, and the iteration budget run exactly as usual — skipping the plan does not skip
 the gate. `--skip-plan` is a flag, not a heuristic: the person typing the task already knows whether
 it needs design.
+
+### From an idea to a night of runs
+
+```bash
+kage shape new "Leave requests with two-level approval" --chat
+kage shape export leave-requests-with-two-level-approval
+kage queue
+```
+
+`kage shape` is engineering intake as a conversation. The shaper (a read-only harness, `roles.shaper`,
+claude-code by default) asks what it needs to, and keeps `PRD.md` and `TICKETS.md` in
+`.kage/shape/<slug>/` up to date — those files, not a chat transcript, are the session's memory, so
+you can edit them by hand between turns. Notes it should know up front are an explicit allowlist:
+
+```yaml
+shape:
+  context:
+    - ../second-brain/HRIS        # a directory contributes its README.md only
+    - ../notes/architecture.md
+```
+
+`export` writes only tickets marked `Status: ready` that carry a `### Definition of done` list.
+
+`kage queue` runs every exported ticket that has not completed, in order — by session, then by
+ticket number. Each is an ordinary run with its plan, gate, and review. A ticket branches from the
+branch its predecessor in the same session completed on, so `t2` sees what `t1` built and the
+session ends as one chain of branches: merge the last one. The queue stops at the first run that
+does not complete; `kage resume <run_id>` and then `kage queue` carry on from there. Which run
+worked which ticket is kept in `.kage/tickets/queue.json`, and with `notify:` configured each run
+announces itself and the queue sends one message when it drains or stops.
 
 ## Configuration
 

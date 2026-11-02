@@ -14,6 +14,7 @@ mod engine;
 mod git;
 mod notify;
 mod paths;
+mod queue;
 mod shape;
 mod state;
 
@@ -101,6 +102,25 @@ enum Command {
     /// Check which tools and integrations are available
     Doctor,
 
+    /// Run the exported tickets in .kage/tickets/ one after another
+    ///
+    /// Each ticket is an ordinary run. A ticket branches from its predecessor's branch in the same
+    /// shaping session, so later tickets see earlier work; the queue stops at the first run that
+    /// does not complete.
+    Queue {
+        /// Show where every ticket stands and run nothing
+        #[arg(long)]
+        list: bool,
+
+        /// Branch tickets with no predecessor from this ref instead of `git.base`
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Do not run the validation commands once before each ticket's first phase
+        #[arg(long)]
+        skip_gate_check: bool,
+    },
+
     /// Talk an idea into a PRD and tickets the loop can run
     Shape {
         #[command(subcommand)]
@@ -178,6 +198,7 @@ async fn main() -> Result<()> {
                     no_isolate,
                     skip_plan,
                     skip_gate_check,
+                    base: None,
                 },
             )
             .await
@@ -190,6 +211,22 @@ async fn main() -> Result<()> {
         Command::Clean { all } => cli::clean(&cwd, all).await,
 
         Command::Doctor => cli::doctor::run(&cwd).await,
+
+        Command::Queue {
+            list,
+            base,
+            skip_gate_check,
+        } => {
+            cli::queue::run(
+                &cwd,
+                cli::queue::QueueOptions {
+                    list,
+                    base,
+                    skip_gate_check,
+                },
+            )
+            .await
+        }
 
         Command::Shape { action } => match action {
             ShapeAction::New { idea, chat } => cli::shape::new(&cwd, &idea, chat).await,

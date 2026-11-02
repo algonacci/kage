@@ -31,6 +31,11 @@ pub struct Options {
     /// The check costs a full test run at startup, which is worth paying to learn the gate is
     /// broken — but not on a suite slow enough that the answer arrives later than the problem.
     pub skip_gate_check: bool,
+    /// Branch the worktree from this ref instead of `git.base`.
+    ///
+    /// The queue's stacking: a ticket written to build on its predecessor must start from the
+    /// branch where that predecessor's work landed, not from a base commit that lacks it.
+    pub base: Option<String>,
 }
 
 /// How a run with no planning phase is described, wherever it is described.
@@ -114,7 +119,7 @@ pub async fn start(
             &project.root,
             &project.worktrees_dir(),
             &run_id,
-            config.git.base.as_deref(),
+            options.base.as_deref().or(config.git.base.as_deref()),
         )
         .await?;
 
@@ -957,6 +962,7 @@ async fn run_agent(
             workdir: state.workdir.clone(),
             log_path,
             label: label.to_string(),
+            echo: true,
         })
         .await
 }
@@ -1655,6 +1661,62 @@ mod tests {
             "a blocked resume must record nothing"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_run_given_a_base_branches_from_it_instead_of_head() {
+        // The queue's stacking rests on this: a second ticket written against the first one's work
+        // must start from the branch holding that work, or its executor builds on code without it.
+        let root = std::env::temp_dir().join(format!("kage-wf-base-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "kage@test.local"],
+            &["config", "user.name", "Kage Test"],
+        ] {
+            git::git(&root, args).await.unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), ".kage/\n").unwrap();
+        git::git(&root, &["add", "."]).await.unwrap();
+        git::git(&root, &["commit", "-m", "initial"]).await.unwrap();
+        git::git(&root, &["checkout", "-b", "earlier-ticket"])
+            .await
+            .unwrap();
+        std::fs::write(root.join("earlier.txt"), "the first ticket's work").unwrap();
+        git::git(&root, &["add", "."]).await.unwrap();
+        git::git(&root, &["commit", "-m", "earlier"]).await.unwrap();
+        git::git(&root, &["checkout", "main"]).await.unwrap();
+
+        crate::config::init(&root, true).unwrap();
+        let project = Project::discover(&root).unwrap();
+        let mut config = project.load_config().unwrap();
+        let echo = role_echo();
+        config.roles.planner = echo.clone();
+        config.roles.executor = echo.clone();
+        config.roles.reviewer = echo;
+        config.loop_config.max_iterations = 0;
+        config.setup.commands.clear();
+
+        let state = start(
+            &project,
+            &config,
+            "task",
+            &Options {
+                skip_plan: true,
+                skip_gate_check: true,
+                base: Some("earlier-ticket".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            state.workdir.join("earlier.txt").is_file(),
+            "the run's checkout lacks the base branch's work"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

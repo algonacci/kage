@@ -56,6 +56,13 @@ pub struct AgentRequest {
     pub log_path: PathBuf,
     /// Short tag for streamed output lines, e.g. `executor#2`.
     pub label: String,
+    /// Whether the backend's output is echoed to the terminal as it arrives.
+    ///
+    /// A loop phase streams, because a half-hour phase with a frozen terminal looks hung. A shaping
+    /// turn does not: its reply is parsed and printed once, formatted, and echoing the raw envelope
+    /// first doubled every answer — noise in a terminal, and worse once a gateway relays stdout to
+    /// a phone. The log is written either way.
+    pub echo: bool,
 }
 
 /// What a backend produced.

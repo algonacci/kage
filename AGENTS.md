@@ -42,6 +42,7 @@ src/
 │   ├── mod.rs           init, run, resume, clean; exit-code mapping
 │   ├── status.rs        run report and the "what do I do now" line
 │   ├── shape.rs         kage shape: new, say, chat, show, list, export
+│   ├── queue.rs         kage queue: run exported tickets in order, stop at the first that fails
 │   └── doctor.rs        environment report (never a gate — it exits Ok even when not ready)
 ├── engine/
 │   ├── workflow.rs      the state machine: start, resume, drive
@@ -66,6 +67,7 @@ src/
 │   └── schema.rs        serde shapes for .kage/config.yaml
 ├── notify.rs            the webhook POST when a run stops; never changes the outcome
 ├── shape.rs             shaping sessions on disk, the reply envelope, tickets and their export
+├── queue.rs             ticket order, the ticket → run ledger, and which branch a ticket stacks on
 └── paths.rs             path normalisation shared by anything handing a path to another program
 ```
 
@@ -170,6 +172,24 @@ when the role is spelled out, and kamui (hangs asking) and opencode (writes free
 never its tree — because the vault it was built for tracks a `Secrets/` folder. A ticket exports only
 when `Status: ready` *and* it has a `### Definition of done` list: that list is what the planner
 turns into acceptance criteria, so "the spec must be complete" is enforced, not hoped for.
+
+**A shaping turn does not echo its harness.** The loop streams every phase because a silent
+half-hour looks hung, but a turn's reply is parsed and printed once, formatted — echoing the raw
+envelope first printed every answer twice, which a gateway relaying stdout to a phone would deliver
+twice too. `AgentRequest::echo` is the switch; capture and the log are unchanged either way.
+
+**The queue is runs in order plus stacking, never a second way to finish a run.** `kage queue`
+takes the task files `export` wrote, sorts them by session and then by ticket number *as a number*
+(by name `t10` precedes `t2`), and hands each to the same start-report-announce path `kage run`
+uses. What it adds is stacking: every run branches from the base commit, so a session's `t2` would
+never see what `t1` built, though the tickets were split precisely so later ones build on earlier
+ones. A ticket therefore branches (`Options::base`) from its nearest earlier sibling's run branch
+when that run completed; another session's tickets never stack, or one feature's branch would carry
+another's commits. The queue stops at the first run that does not complete instead of skipping
+ahead: later tickets in the session were written against its work, and the remedy — `kage resume`,
+then `kage queue` — continues the existing attempt rather than starting a second one beside it.
+`.kage/tickets/queue.json` records only which run worked which ticket; how it ended is read from
+run state each time, so a resume done by hand is never contradicted by a stale copy.
 
 **Validation runs in Kage's process, never inside an agent.** An agent reporting "tests pass" is a
 claim. An exit code is evidence.
@@ -339,9 +359,9 @@ something already fixed — and a fixed entry left here is a lie told with autho
   and export are tested, and the whole flow was driven end to end with a `command:` shaper printing
   a fixed envelope. Whether claude reliably answers inside the envelope, and stays read-only while
   reading the repository, is unproven until a real session runs.
-- **A shaping turn echoes its raw output before the formatted reply.** Turns share `proc::run`'s
-  live streaming with the loop, so a passthrough shaper prints the whole envelope and then the
-  reply again. Harmless, but a chat wants only the reply.
+- **The queue has only met fake harnesses.** Ordering, stacking, the stop, and resume-then-continue
+  were driven end to end with `command:` roles in a scratch repository. A night of real tickets is
+  what will show whether stopping at the first failure is the right default or too timid.
 
 ## Where the work stands
 

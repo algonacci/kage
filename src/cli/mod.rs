@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod doctor;
+pub mod queue;
 pub mod shape;
 pub mod status;
 
@@ -71,23 +72,31 @@ pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
         ),
     }
 
-    let state = match workflow::start(&project, &config, task, &options).await {
+    let state = start(&project, &config, task, &options).await?;
+    exit_for(&state)
+}
+
+/// Start a run and see it through to its summary and its notification.
+///
+/// Shared by `kage run` and the queue so a queued ticket is reported and announced exactly as a
+/// typed one would be — the queue adds order, never a second way of finishing a run.
+pub(crate) async fn start(
+    project: &Project,
+    config: &Config,
+    task: &str,
+    options: &Options,
+) -> Result<RunState> {
+    let state = match workflow::start(project, config, task, options).await {
         Ok(state) => state,
         Err(error) => {
-            notify::announce_error(
-                config.notify.as_ref(),
-                &project_name(&project),
-                None,
-                &error,
-            )
-            .await;
+            notify::announce_error(config.notify.as_ref(), &project_name(project), None, &error)
+                .await;
             return Err(error);
         }
     };
     report(&state);
-    announce(&project, &config, &state).await;
-
-    exit_for(&state)
+    announce(project, config, &state).await;
+    Ok(state)
 }
 
 /// `kage resume [run_id]` — continue an interrupted run.
@@ -142,7 +151,7 @@ async fn announce(project: &Project, config: &Config, state: &RunState) {
 }
 
 /// The repository's directory name — what a person juggling several repos recognises.
-fn project_name(project: &Project) -> String {
+pub(crate) fn project_name(project: &Project) -> String {
     project
         .root
         .file_name()

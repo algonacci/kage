@@ -216,6 +216,23 @@ pub async fn announce_error(
     deliver(notify, NotifyEvent::Failed, project, &facts, &text).await;
 }
 
+/// Announce how a queue ended. The runs inside it announced themselves; this is the one message
+/// that says whether the rest of the night's tickets ran or are still waiting.
+pub async fn announce_queue(
+    notify: Option<&Notify>,
+    project: &str,
+    event: NotifyEvent,
+    text: &str,
+) {
+    let facts = RunFacts {
+        run_id: None,
+        phase: None,
+        branch: None,
+    };
+    let text = truncate(text, MAX_MESSAGE_CHARS);
+    deliver(notify, event, project, &facts, &text).await;
+}
+
 async fn deliver(
     notify: Option<&Notify>,
     event: NotifyEvent,

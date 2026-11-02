@@ -174,7 +174,7 @@ impl AgentAdapter for CliAdapter {
             stdin,
             raw_command: None,
             timeout: self.timeout,
-            stream_prefix: Some(format!("  [{}]", request.label)),
+            stream_prefix: request.echo.then(|| format!("  [{}]", request.label)),
             stdout_format: self.stdout_format,
             // A thinking planner can sit silent for minutes; the heartbeat is what tells a working
             // run from a frozen one.
@@ -395,6 +395,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_quiet_run_still_captures_and_logs_what_the_harness_said() {
+        // Shaping turns stopped echoing so the reply is printed once; the quiet path must not
+        // also stop capturing, or the reply parser would be handed nothing to parse.
+        let dir = std::env::temp_dir().join(format!("kage-cli-quiet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut config = RoleConfig::preset(AdapterKind::Command);
+        config.command = Some(vec!["cmd".into(), "/C".into(), "echo quiet-marker".into()]);
+        if !cfg!(windows) {
+            config.command = Some(vec!["sh".into(), "-c".into(), "echo quiet-marker".into()]);
+        }
+
+        let log_path = dir.join("log.txt");
+        let result = adapter(&config)
+            .run(AgentRequest {
+                prompt: "x".into(),
+                prompt_file: dir.join("prompt.md"),
+                workdir: dir.clone(),
+                log_path: log_path.clone(),
+                label: "shaper".into(),
+                echo: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(result.stdout.contains("quiet-marker"), "{}", result.stdout);
+        assert!(
+            std::fs::read_to_string(&log_path)
+                .unwrap()
+                .contains("quiet-marker")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn running_an_adapter_writes_the_prompt_file() {
         let dir = std::env::temp_dir().join(format!("kage-cli-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -413,6 +448,7 @@ mod tests {
                 workdir: dir.clone(),
                 log_path: dir.join("log.txt"),
                 label: "executor".into(),
+                echo: true,
             })
             .await
             .unwrap();

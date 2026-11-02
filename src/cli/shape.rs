@@ -152,6 +152,7 @@ async fn turn(
             workdir: project.root.clone(),
             log_path: log_path.clone(),
             label: "shaper".to_string(),
+            echo: false,
         })
         .await?;
 
