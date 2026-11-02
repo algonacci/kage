@@ -2,6 +2,7 @@
 
 pub mod doctor;
 pub mod queue;
+pub mod render;
 pub mod shape;
 pub mod status;
 

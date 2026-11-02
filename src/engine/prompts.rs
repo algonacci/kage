@@ -572,6 +572,10 @@ pub fn shaper(turn: &ShapeTurn) -> String {
          {repo}\n\n\
          ## How to shape\n\n\
          - Reply in the language the owner writes in.\n\
+         - Be brief: the owner reads you in a terminal, often tired. No preamble, no recap of what \
+         they just said, no restating tickets or the PRD — they are saved and shown separately. \
+         Say what you changed in one line per ticket, then your questions. Aim for under fifteen \
+         lines. Markdown is rendered: bold, bullets and `code` work; tables do not.\n\
          - Ask at most three questions per turn, the ones whose answers change the design most. \
          When something has a sensible default, propose it instead of asking.\n\
          - Update the PRD as soon as you learn something, even if it is incomplete. Mark open \
@@ -1178,6 +1182,10 @@ mod tests {
 
         assert!(!prompt.contains("do not ask any"), "{prompt}");
         assert!(prompt.contains("at most three questions"));
+        assert!(
+            prompt.contains("Be brief"),
+            "the first live session's replies were too long to read"
+        );
         assert!(prompt.contains("Bikin fitur cuti"));
         assert!(prompt.contains("(this is the first turn)"));
     }

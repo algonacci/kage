@@ -43,6 +43,7 @@ src/
 │   ├── status.rs        run report and the "what do I do now" line
 │   ├── shape.rs         kage shape: new, say, chat, show, list, export
 │   ├── queue.rs         kage queue: run exported tickets in order, stop at the first that fails
+│   ├── render.rs        terminal Markdown and colour for the shaping chat; plain when piped
 │   └── doctor.rs        environment report (never a gate — it exits Ok even when not ready)
 ├── engine/
 │   ├── workflow.rs      the state machine: start, resume, drive
@@ -173,6 +174,15 @@ when the role is spelled out, and kamui (hangs asking) and opencode (writes free
 never its tree — because the vault it was built for tracks a `Secrets/` folder. A ticket exports only
 when `Status: ready` *and* it has a `### Definition of done` list: that list is what the planner
 turns into acceptance criteria, so "the spec must be complete" is enforced, not hoped for.
+
+**A shaping reply is styled for a terminal and left as Markdown for anything else.** The first
+real session was called painful to read: long replies printed as raw `**` and backticks between
+grey dashes. `cli/render.rs` renders the subset a reply uses and colours the rules between turns,
+but only when stdout is a terminal and `NO_COLOR` is unset — `kage shape say` relayed to a phone
+must arrive as Markdown the chat app renders, not escape codes. The shaper is also told to be
+brief, because the PRD and tickets are saved and shown separately and need no restating. Input is
+cleaned too: Shift+Enter in a terminal that reports modified keys arrives as `ESC[27;2;13~` on the
+same line, and it was being sent to the shaper verbatim.
 
 **A document the owner names is fetched into the session, not left out of reach.** The first live
 session stalled when the owner asked the shaper to read a review PDF in `~/Downloads`: the harness

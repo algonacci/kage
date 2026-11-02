@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use super::render::{self, Style};
 use crate::adapters::{self, AgentRequest, Role, preflight};
 use crate::config::{Config, Project};
 use crate::engine::prompts;
@@ -217,10 +218,13 @@ async fn turn(
 }
 
 async fn chat_loop(project: &Project, config: &Config, session: &Session) -> Result<()> {
+    let style = Style::detect();
     println!(
-        "\nType a message and press Enter. End a line with \\ to continue it.\n\
-         /attach <file>  hand the shaper a document · /show  where it stands\n\
-         /export  write ready tickets · /exit  leave\n"
+        "\n{}\n",
+        style.dim(
+            "Just talk — name a file and the shaper gets it. Shift+Enter or a trailing \\ for a new line.\n\
+             /show  where it stands · /export  write ready tickets · /exit  leave"
+        )
     );
 
     let stdin = std::io::stdin();
@@ -277,7 +281,9 @@ async fn chat_loop(project: &Project, config: &Config, session: &Session) -> Res
 fn read_message(stdin: &std::io::Stdin) -> Result<Option<String>> {
     let mut message = String::new();
     loop {
-        print!("{}", if message.is_empty() { "you> " } else { "...> " });
+        let style = Style::detect();
+        let prompt = if message.is_empty() { "you> " } else { "...> " };
+        print!("{}", style.bold(prompt, "32"));
         std::io::stdout().flush().ok();
 
         let mut line = String::new();
@@ -289,14 +295,14 @@ fn read_message(stdin: &std::io::Stdin) -> Result<Option<String>> {
             return Ok((!message.is_empty()).then_some(message));
         }
 
-        let line = line.trim_end_matches(['\n', '\r']);
+        let line = render::clean_input(line.trim_end_matches(['\n', '\r']));
         match line.strip_suffix('\\') {
             Some(continued) => {
                 message.push_str(continued);
                 message.push('\n');
             }
             None => {
-                message.push_str(line);
+                message.push_str(&line);
                 return Ok(Some(message));
             }
         }
@@ -309,9 +315,9 @@ fn print_attached(project: &Project, path: &Path) {
 }
 
 fn print_reply(session: &Session, reply: &Reply) {
-    println!("\n{}\n", "-".repeat(60));
-    println!("{}", reply.message.trim());
-    println!("\n{}", "-".repeat(60));
+    let style = Style::detect();
+    println!("\n{}\n", style.rule("shaper", "36"));
+    println!("{}", style.markdown(reply.message.trim()));
 
     let mut changed = Vec::new();
     if reply.prd.is_some() {
@@ -325,7 +331,8 @@ fn print_reply(session: &Session, reply: &Reply) {
     } else {
         changed.join(", ")
     };
-    println!("{changed} · {}\n", ticket_summary(session));
+    let status = format!("{changed} · {}", ticket_summary(session));
+    println!("\n{}\n", style.rule(&status, "2"));
 }
 
 fn print_status(session: &Session) -> Result<()> {
