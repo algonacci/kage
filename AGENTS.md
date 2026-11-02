@@ -174,6 +174,18 @@ never its tree — because the vault it was built for tracks a `Secrets/` folder
 when `Status: ready` *and* it has a `### Definition of done` list: that list is what the planner
 turns into acceptance criteria, so "the spec must be complete" is enforced, not hoped for.
 
+**A document the owner names is fetched into the session, not left out of reach.** The first live
+session stalled when the owner asked the shaper to read a review PDF in `~/Downloads`: the harness
+sandboxes itself to the project, and the remedy it offered — copy the file, or widen permissions —
+was a chore the owner should never have to know about. So each turn scans the message for a path
+outside the project, or the bare name of a file directly in Downloads, Desktop or Documents, and
+copies it into `.kage/shape/<slug>/attachments/` before the shaper runs; every attachment is then
+listed in the prompt. Matching a bare name is deliberately shallow — top level only, names of five
+characters or more with an extension — because a deeper search would copy files nobody asked for.
+The same content named again is the copy already there, so a file mentioned in every message is
+attached once. Attachments are git-ignored: they are what the owner pointed at, often someone
+else's document, and the PRD records what was decided from them.
+
 **A shaping turn does not echo its harness.** The loop streams every phase because a silent
 half-hour looks hung, but a turn's reply is parsed and printed once, formatted — echoing the raw
 envelope first printed every answer twice, which a gateway relaying stdout to a phone would deliver

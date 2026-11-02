@@ -5,7 +5,7 @@
 //! than `say` in a terminal loop, so the two can never behave differently.
 
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -88,6 +88,17 @@ pub fn list(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `kage shape attach <slug> <file>...` — copy documents into the session without spending a turn.
+pub fn attach(cwd: &Path, slug: &str, files: &[PathBuf]) -> Result<()> {
+    let (project, _) = load(cwd)?;
+    let session = shape::open(&project, slug)?;
+    for file in files {
+        print_attached(&project, &session.attach(&cwd.join(file))?.path);
+    }
+    println!("The shaper reads them from your next message.");
+    Ok(())
+}
+
 /// `kage shape export <slug>` — write each runnable ticket as a task file.
 pub fn export(cwd: &Path, slug: &str) -> Result<()> {
     let (project, _) = load(cwd)?;
@@ -125,6 +136,17 @@ async fn turn(
     let context = shape::load_context(&project.root, &config.shape);
     let prd = session.read_prd();
     let tickets = session.read_tickets();
+    // A file named in the message is attached before the shaper sees it: the owner should be able
+    // to say "check REVIEW.pdf in my downloads" and never learn that the shaper cannot reach there.
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for file in shape::mentioned_files(message, &project.root, home.as_deref()) {
+        match session.attach(&file) {
+            Ok(attached) if attached.copied => print_attached(project, &attached.path),
+            Ok(_) => {}
+            Err(error) => println!("  could not attach {}: {error:#}", file.display()),
+        }
+    }
+    let attachments = session.attachments();
 
     let prompt = prompts::shaper(&prompts::ShapeTurn {
         workdir: &project.root,
@@ -134,6 +156,7 @@ async fn turn(
         tickets: &tickets,
         recent: &recent,
         omitted_turns: omitted,
+        attachments: &attachments,
         message,
     });
 
@@ -196,7 +219,8 @@ async fn turn(
 async fn chat_loop(project: &Project, config: &Config, session: &Session) -> Result<()> {
     println!(
         "\nType a message and press Enter. End a line with \\ to continue it.\n\
-         /show  where it stands · /export  write ready tickets · /exit  leave\n"
+         /attach <file>  hand the shaper a document · /show  where it stands\n\
+         /export  write ready tickets · /exit  leave\n"
     );
 
     let stdin = std::io::stdin();
@@ -220,6 +244,24 @@ async fn chat_loop(project: &Project, config: &Config, session: &Session) -> Res
                 continue;
             }
             _ => {}
+        }
+        if let Some(typed) = message.trim().strip_prefix("/attach") {
+            let typed = typed.trim();
+            if typed.is_empty() {
+                println!(
+                    "usage: /attach <file>   (dragging the file into the terminal types its path)"
+                );
+                continue;
+            }
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            match session.attach(&shape::typed_path(typed, home.as_deref())) {
+                Ok(attached) => {
+                    print_attached(project, &attached.path);
+                    println!("Now tell the shaper what to do with it.\n");
+                }
+                Err(error) => println!("{error:#}\n"),
+            }
+            continue;
         }
 
         // A failed turn is reported and the loop carries on: the session is unchanged, and leaving
@@ -259,6 +301,11 @@ fn read_message(stdin: &std::io::Stdin) -> Result<Option<String>> {
             }
         }
     }
+}
+
+fn print_attached(project: &Project, path: &Path) {
+    let shown = path.strip_prefix(&project.root).unwrap_or(path);
+    println!("attached {}", shown.display());
 }
 
 fn print_reply(session: &Session, reply: &Reply) {

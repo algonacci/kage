@@ -53,7 +53,8 @@ whether the project is ready.
 | `kage doctor` | Check which tools are available |
 | `kage shape new "<idea>" [--chat]` | Start a shaping session: talk an idea into `PRD.md` and tickets |
 | `kage shape say <slug> "<message>"` | One shaping turn (what a messaging gateway calls) |
-| `kage shape chat <slug>` | Shape in a terminal loop (`/show`, `/export`, `/exit`) |
+| `kage shape chat <slug>` | Shape in a terminal loop (`/attach`, `/show`, `/export`, `/exit`) |
+| `kage shape attach <slug> <file>...` | Hand the shaper documents from outside the project |
 | `kage shape show <slug>` / `list` | Where a session stands / every session |
 | `kage shape export <slug>` | Write each ready ticket to `.kage/tickets/` as a task file |
 | `kage queue [--list] [--base REF]` | Run the exported tickets one after another |
@@ -118,6 +119,13 @@ shape:
     - ../second-brain/HRIS        # a directory contributes its README.md only
     - ../notes/architecture.md
 ```
+
+Point at a document the way you would to a colleague — "check REVIEW CRM UPDATE (1).pdf in my
+downloads", a path, or a file dragged into the terminal. A file named in a message that sits outside
+the project (or directly in `~/Downloads`, `~/Desktop`, `~/Documents`) is copied into the session's
+`attachments/` before the shaper answers, because a harness only sees its working directory.
+`/attach <file>` in the chat, or `kage shape attach <slug> <file>...`, does the same explicitly.
+Attachments are git-ignored; the PRD carries what was decided from them.
 
 `export` writes only tickets marked `Status: ready` that carry a `### Definition of done` list.
 

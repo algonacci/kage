@@ -167,6 +167,17 @@ enum ShapeAction {
     /// List shaping sessions
     List,
 
+    /// Copy documents into a session so the shaper can read them on the next turn
+    ///
+    /// The shaper only sees files inside the project; a PDF in ~/Downloads is out of its reach.
+    Attach {
+        /// The session's name, as `kage shape list` prints it
+        slug: String,
+        /// The files to attach
+        #[arg(required = true)]
+        files: Vec<std::path::PathBuf>,
+    },
+
     /// Write each ready ticket to .kage/tickets/ as a task file for `kage run --task-file`
     Export {
         /// The session's name, as `kage shape list` prints it
@@ -235,6 +246,7 @@ async fn main() -> Result<()> {
             ShapeAction::Chat { slug } => cli::shape::chat(&cwd, &slug).await,
             ShapeAction::Show { slug } => cli::shape::show(&cwd, &slug),
             ShapeAction::List => cli::shape::list(&cwd),
+            ShapeAction::Attach { slug, files } => cli::shape::attach(&cwd, &slug, &files),
             ShapeAction::Export { slug } => cli::shape::export(&cwd, &slug),
         },
     }

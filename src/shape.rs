@@ -78,6 +78,81 @@ impl Session {
         self.dir.join("logs")
     }
 
+    /// Files the owner handed the session. Inside the project on purpose: a harness sandboxes
+    /// itself to its working directory, so a review PDF left in `~/Downloads` is unreadable to the
+    /// shaper however it is named in a message — the first live session stalled on exactly that.
+    pub fn attachments_dir(&self) -> PathBuf {
+        self.dir.join("attachments")
+    }
+
+    /// Every attached file, by name.
+    pub fn attachments(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(self.attachments_dir()) else {
+            return Vec::new();
+        };
+        let mut files: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// Copy a file into the session, keeping its name. A copy rather than a link, so the session
+    /// still holds what was discussed after the original is moved or deleted; a name already taken
+    /// by different content gets a numbered sibling rather than replacing what an earlier turn
+    /// read, and the same content again is the copy already there — a file is named in every
+    /// message that talks about it, and each mention must not add another.
+    pub fn attach(&self, source: &Path) -> Result<Attached> {
+        if !source.is_file() {
+            bail!(
+                "{} is not a file — pass the path of the document to attach",
+                source.display()
+            );
+        }
+        let name = source
+            .file_name()
+            .with_context(|| format!("{} has no file name", source.display()))?;
+        let dir = self.attachments_dir();
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
+
+        let stem = Path::new(name)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let extension = Path::new(name)
+            .extension()
+            .map(|ext| format!(".{}", ext.to_string_lossy()))
+            .unwrap_or_default();
+        let content =
+            std::fs::read(source).with_context(|| format!("cannot read {}", source.display()))?;
+        for n in 1.. {
+            let target = if n == 1 {
+                dir.join(name)
+            } else {
+                dir.join(format!("{stem}-{n}{extension}"))
+            };
+            if !target.exists() {
+                std::fs::write(&target, &content).with_context(|| {
+                    format!("cannot copy {} into {}", source.display(), target.display())
+                })?;
+                return Ok(Attached {
+                    path: target,
+                    copied: true,
+                });
+            }
+            if std::fs::read(&target).is_ok_and(|existing| existing == content) {
+                return Ok(Attached {
+                    path: target,
+                    copied: false,
+                });
+            }
+        }
+        unreachable!("an unbounded range always yields a free name")
+    }
+
     pub fn read_prd(&self) -> String {
         std::fs::read_to_string(self.prd()).unwrap_or_default()
     }
@@ -142,6 +217,109 @@ impl Session {
             &render_conversation(&self.slug, &turns),
         )
     }
+}
+
+/// Where an attached file ended up, and whether this call put it there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attached {
+    pub path: PathBuf,
+    pub copied: bool,
+}
+
+/// The folders searched for a file the owner names without a path. Top level only: a name is
+/// matched against what is directly there, never against a tree that may hold anything at all.
+const NAMED_FILE_DIRS: [&str; 3] = ["Downloads", "Desktop", "Documents"];
+
+/// Files a message points at that the shaper could not open itself: a path outside the project
+/// (`~/Downloads/review.pdf`, a file dragged into the terminal), or the bare name of a file sitting
+/// in Downloads, Desktop or Documents ("cek REVIEW CRM UPDATE (1).pdf di downloads"). The owner
+/// should not need to know that a harness only sees its working directory, nor learn a command to
+/// get around it — the first live session stalled on exactly that. A file inside the project is
+/// skipped: the shaper reads it in place.
+pub fn mentioned_files(message: &str, project_root: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut add = |path: PathBuf| {
+        if path.is_file() && !path.starts_with(project_root) && !found.contains(&path) {
+            found.push(path);
+        }
+    };
+
+    for word in words(message) {
+        let word = word.trim_end_matches([',', '.', '?', '!', ';', ':']);
+        if word.starts_with('/') || word.starts_with("~/") {
+            add(expand_home(word, home));
+        }
+    }
+
+    let lowered = message.to_lowercase();
+    for dir in NAMED_FILE_DIRS {
+        let Some(dir) = home.map(|home| home.join(dir)) else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut names: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        names.sort();
+        for path in names {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_lowercase()) else {
+                continue;
+            };
+            // A name with an extension and some length, or "a.md" would match half of all prose.
+            if name.len() >= 5
+                && name.contains('.')
+                && !name.starts_with('.')
+                && lowered.contains(&name)
+            {
+                add(path);
+            }
+        }
+    }
+    found
+}
+
+/// A path as a person types it: quoted, backslash-escaped the way a terminal writes a dragged-in
+/// file (`REVIEW\ CRM\ UPDATE\ \(1\).pdf`), or starting at `~`. `home` is passed in so the
+/// expansion is testable without touching the process environment.
+pub fn typed_path(typed: &str, home: Option<&Path>) -> PathBuf {
+    expand_home(&words(typed).join(" "), home)
+}
+
+fn expand_home(text: &str, home: Option<&Path>) -> PathBuf {
+    match (text.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => home.join(rest),
+        _ => PathBuf::from(text),
+    }
+}
+
+/// Split text the way a shell would: whitespace separates, quotes group, a backslash escapes.
+fn words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(open), c) if c == open => quote = None,
+            (Some(_), c) => current.push(c),
+            // Only at the start of a word: "it's in ~/x.pdf" must not swallow the path.
+            (None, '"' | '\'') if current.is_empty() => quote = Some(c),
+            (None, '\\') => current.extend(chars.next()),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 fn write_artifact(path: &Path, text: &str) -> Result<()> {
@@ -689,6 +867,107 @@ mod tests {
             "only named entries are read: {text}"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_attachment_is_copied_in_once_and_never_replaces_different_content() {
+        let root = temp_root("attach");
+        let outside = root.join("Downloads");
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = outside.join("REVIEW CRM (1).pdf");
+        std::fs::write(&source, "first").unwrap();
+        let session = Session {
+            slug: "crm".to_string(),
+            dir: root.join("session"),
+        };
+
+        let first = session.attach(&source).unwrap();
+        let again = session.attach(&source).unwrap();
+        std::fs::write(&source, "second").unwrap();
+        let second = session.attach(&source).unwrap();
+        std::fs::remove_file(&source).unwrap();
+
+        assert!(first.copied);
+        assert_eq!(
+            again,
+            Attached {
+                path: first.path.clone(),
+                copied: false
+            },
+            "a second mention adds nothing"
+        );
+        assert!(
+            second.copied && second.path.ends_with("REVIEW CRM (1)-2.pdf"),
+            "{second:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&first.path).unwrap(),
+            "first",
+            "survives the original"
+        );
+        assert_eq!(session.attachments().len(), 2);
+        assert!(session.attach(&outside).is_err(), "a directory is refused");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_named_in_a_message_is_found_without_a_command() {
+        // The first live session: the owner asked the shaper to "check the downloads folder" for a
+        // PDF, and the harness, sandboxed to the project, could not open it.
+        let home = temp_root("mention");
+        let project = home.join("project");
+        std::fs::create_dir_all(home.join("Downloads")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let review = home.join("Downloads/REVIEW CRM UPDATE (1).pdf");
+        std::fs::write(&review, "pdf").unwrap();
+        std::fs::write(home.join("Downloads/a.md"), "short").unwrap();
+        let notes = home.join("notes.txt");
+        std::fs::write(&notes, "notes").unwrap();
+        std::fs::write(project.join("inside.md"), "here").unwrap();
+
+        let by_name = mentioned_files(
+            "bisa cek folder downloads? ada file review crm update (1).pdf disana. a.md juga",
+            &project,
+            Some(&home),
+        );
+        let by_path = mentioned_files(
+            &format!(
+                "it's in ~/notes.txt, and {}",
+                project.join("inside.md").display()
+            ),
+            &project,
+            Some(&home),
+        );
+        let dragged = mentioned_files(
+            r"liat ~/Downloads/REVIEW\ CRM\ UPDATE\ \(1\).pdf dong",
+            &project,
+            Some(&home),
+        );
+
+        assert_eq!(
+            by_name,
+            vec![review.clone()],
+            "a short name never matches prose"
+        );
+        assert_eq!(by_path, vec![notes], "a project file is read in place");
+        assert_eq!(dragged, vec![review]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_typed_path_loses_quotes_and_terminal_escapes() {
+        assert_eq!(
+            typed_path(r"/Users/me/REVIEW\ CRM\ \(1\).pdf", None),
+            PathBuf::from("/Users/me/REVIEW CRM (1).pdf")
+        );
+        assert_eq!(
+            typed_path("'~/Downloads/a b.pdf'", Some(Path::new("/Users/me"))),
+            PathBuf::from("/Users/me/Downloads/a b.pdf")
+        );
+        assert_eq!(
+            typed_path("/tmp/a b.pdf", None),
+            PathBuf::from("/tmp/a b.pdf")
+        );
     }
 
     #[test]

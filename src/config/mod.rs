@@ -151,9 +151,14 @@ pub fn init(root: &Path, force: bool) -> Result<PathBuf> {
     }
 
     // Worktrees are disposable checkouts; committing them would be nonsense. Runs and artifacts are
-    // deliberately left tracked — a plan and a review are engineering records worth keeping.
-    std::fs::write(kage_dir.join(".gitignore"), "worktrees/\nruns/*/logs/\n")
-        .context("cannot write .kage/.gitignore")?;
+    // deliberately left tracked — a plan and a review are engineering records worth keeping. A
+    // shaping attachment is not: it is whatever the owner pointed at — a client's review PDF, a
+    // spreadsheet — and the PRD already carries what was decided from it.
+    std::fs::write(
+        kage_dir.join(".gitignore"),
+        "worktrees/\nruns/*/logs/\nshape/*/attachments/\n",
+    )
+    .context("cannot write .kage/.gitignore")?;
 
     std::fs::write(&config_path, starter_config(root))
         .with_context(|| format!("cannot write {}", config_path.display()))?;
