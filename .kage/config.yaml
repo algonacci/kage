@@ -16,8 +16,8 @@ roles:
     timeout_secs: 3600
 
   reviewer:
-    adapter: codex
-    # model: gpt-5.6-sol
+    adapter: claude-code
+    model: opus
 
 # Any binary that takes a prompt can fill a role:
 #
