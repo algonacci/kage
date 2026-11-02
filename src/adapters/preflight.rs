@@ -58,12 +58,13 @@ pub fn program_for(config: &RoleConfig) -> String {
     }
 }
 
-/// Resolve all three roles, in the order the loop uses them.
+/// Resolve every role: the loop's three in the order it uses them, then the shaper.
 pub fn inspect(roles: &Roles) -> Vec<RoleProgram<'_>> {
     [
         (Role::Planner, &roles.planner),
         (Role::Executor, &roles.executor),
         (Role::Reviewer, &roles.reviewer),
+        (Role::Shaper, &roles.shaper),
     ]
     .into_iter()
     .map(|(role, config)| {
@@ -158,6 +159,8 @@ mod tests {
             planner: role_step_with_program(&current_exe()),
             executor: role_step_with_program(&current_exe()),
             reviewer: role_step_with_program(&current_exe()),
+            // Never spawned by a run, so its absence must never refuse one.
+            shaper: role_step_with_program("kage-shaper-not-installed"),
         };
 
         assert!(check(&config_with(roles), &roles_to_check()).is_ok());
@@ -169,6 +172,8 @@ mod tests {
             planner: role_step_with_program(&current_exe()),
             executor: role_step_with_program(&current_exe()),
             reviewer: role_step_with_program("kage-definitely-not-installed"),
+            // Never spawned by a run, so its absence must never refuse one.
+            shaper: role_step_with_program("kage-shaper-not-installed"),
         };
 
         let error = check(&config_with(roles), &roles_to_check())
@@ -186,6 +191,8 @@ mod tests {
             planner: role_step_with_program("kage-definitely-not-installed"),
             executor: role_step_with_program(&current_exe()),
             reviewer: role_step_with_program("kage-definitely-not-installed"),
+            // Never spawned by a run, so its absence must never refuse one.
+            shaper: role_step_with_program("kage-shaper-not-installed"),
         };
 
         let error = check(&config_with(roles), &roles_to_check())
@@ -210,6 +217,8 @@ mod tests {
             planner: role_step_with_program(&current_exe()),
             executor: role_step_with_program(&current_exe()),
             reviewer: RoleConfig::preset(AdapterKind::Command),
+            // Never spawned by a run, so its absence must never refuse one.
+            shaper: role_step_with_program("kage-shaper-not-installed"),
         };
 
         let error = check(&config_with(roles), &roles_to_check())
@@ -224,6 +233,22 @@ mod tests {
     }
 
     #[test]
+    fn shaping_checks_the_shaper_and_nothing_else() {
+        let roles = Roles {
+            planner: role_step_with_program("kage-definitely-not-installed"),
+            executor: role_step_with_program("kage-definitely-not-installed"),
+            reviewer: role_step_with_program("kage-definitely-not-installed"),
+            shaper: role_step_with_program(&current_exe()),
+        };
+        let config = config_with(roles);
+
+        assert!(
+            check(&config, &[Role::Shaper]).is_ok(),
+            "talking about a change must not require the harnesses that would make it"
+        );
+    }
+
+    #[test]
     fn a_role_the_run_will_not_spawn_is_not_required() {
         // The whole point of scoping preflight to the roles a run spawns: skipping planning must
         // not be refused because the configured planner is not installed.
@@ -231,6 +256,8 @@ mod tests {
             planner: role_step_with_program("kage-definitely-not-installed"),
             executor: role_step_with_program(&current_exe()),
             reviewer: role_step_with_program(&current_exe()),
+            // Never spawned by a run, so its absence must never refuse one.
+            shaper: role_step_with_program("kage-shaper-not-installed"),
         };
         let config = config_with(roles);
 

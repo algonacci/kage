@@ -55,7 +55,7 @@ impl CliAdapter {
         };
 
         let mut template = template;
-        template.extend(config.resolved_extra_args());
+        template.extend(config.resolved_extra_args_for(role));
 
         Ok(Self {
             role,

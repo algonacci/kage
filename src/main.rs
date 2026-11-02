@@ -14,6 +14,7 @@ mod engine;
 mod git;
 mod notify;
 mod paths;
+mod shape;
 mod state;
 
 use anyhow::Result;
@@ -99,6 +100,57 @@ enum Command {
 
     /// Check which tools and integrations are available
     Doctor,
+
+    /// Talk an idea into a PRD and tickets the loop can run
+    Shape {
+        #[command(subcommand)]
+        action: ShapeAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ShapeAction {
+    /// Start a session from an idea and take the first turn
+    New {
+        /// What you want, in plain language
+        idea: String,
+
+        /// Stay in an interactive chat after the first reply
+        #[arg(long)]
+        chat: bool,
+    },
+
+    /// Send one message to a session and print the reply
+    ///
+    /// One turn per invocation, with everything read from and written to disk — which is what lets
+    /// a messaging gateway drive a session from a phone.
+    Say {
+        /// The session's name, as `kage shape list` prints it
+        slug: String,
+        /// The message
+        message: String,
+    },
+
+    /// Keep talking to a session in the terminal
+    Chat {
+        /// The session's name, as `kage shape list` prints it
+        slug: String,
+    },
+
+    /// Show a session's PRD, tickets, and which are ready, without spending a turn
+    Show {
+        /// The session's name, as `kage shape list` prints it
+        slug: String,
+    },
+
+    /// List shaping sessions
+    List,
+
+    /// Write each ready ticket to .kage/tickets/ as a task file for `kage run --task-file`
+    Export {
+        /// The session's name, as `kage shape list` prints it
+        slug: String,
+    },
 }
 
 #[tokio::main]
@@ -138,6 +190,15 @@ async fn main() -> Result<()> {
         Command::Clean { all } => cli::clean(&cwd, all).await,
 
         Command::Doctor => cli::doctor::run(&cwd).await,
+
+        Command::Shape { action } => match action {
+            ShapeAction::New { idea, chat } => cli::shape::new(&cwd, &idea, chat).await,
+            ShapeAction::Say { slug, message } => cli::shape::say(&cwd, &slug, &message).await,
+            ShapeAction::Chat { slug } => cli::shape::chat(&cwd, &slug).await,
+            ShapeAction::Show { slug } => cli::shape::show(&cwd, &slug),
+            ShapeAction::List => cli::shape::list(&cwd),
+            ShapeAction::Export { slug } => cli::shape::export(&cwd, &slug),
+        },
     }
 }
 

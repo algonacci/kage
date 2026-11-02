@@ -11,7 +11,16 @@ verdict and an exit code decide whether it is accepted.
 
 Positioning: [Kamui](https://github.com/algonacci/kamui) is a general-purpose agent, Kumo is a
 messaging gateway, Kage manages engineering processes. Kage must stay fully usable without either.
-Personal memory, email, calendar, and chat belong in those projects, not here.
+Personal memory, email, calendar, and general chat belong in those projects, not here.
+
+The line is drawn by what the work produces, not by what it looks like. Anything that ends in an
+engineering artifact Kage can hold an agent to — a plan, a ticket, a verdict — is Kage's, even when
+it arrives as a conversation: shaping a task into tickets is intake for the loop, and its memory is
+the artifacts it writes, never a transcript. Anything that ends in a message is the other projects'.
+So Kage speaks to the outside through plain interfaces: a task file in, a webhook out when a run
+stops. Issue trackers stay outside too — an agent with the tracker's MCP server reads a ticket and
+hands it to `kage run --task-file`, so no tracker API or credential lives here. Telegram, Slack, or a
+phone reach Kage through Kumo calling Kage's commands, not through code here.
 
 ## The loop
 
@@ -32,6 +41,7 @@ src/
 ├── cli/
 │   ├── mod.rs           init, run, resume, clean; exit-code mapping
 │   ├── status.rs        run report and the "what do I do now" line
+│   ├── shape.rs         kage shape: new, say, chat, show, list, export
 │   └── doctor.rs        environment report (never a gate — it exits Ok even when not ready)
 ├── engine/
 │   ├── workflow.rs      the state machine: start, resume, drive
@@ -55,6 +65,7 @@ src/
 │   ├── mod.rs           project discovery, kage init, starter config
 │   └── schema.rs        serde shapes for .kage/config.yaml
 ├── notify.rs            the webhook POST when a run stops; never changes the outcome
+├── shape.rs             shaping sessions on disk, the reply envelope, tickets and their export
 └── paths.rs             path normalisation shared by anything handing a path to another program
 ```
 
@@ -141,6 +152,24 @@ end in silence. Telegram or Slack delivery is the receiver's business, which kee
 (see Positioning). The secret travels in a header the config must name, because receivers disagree
 and a guessed name fails as a 401 only after the run has been paid for. A failed notification is a
 printed warning and never touches the exit code: the run is over and its state is on disk.
+
+**Shaping is a conversation whose memory is files, one turn per invocation.** `kage shape` is
+intake for the loop, not a fourth loop role: the shaper talks to the owner and ends in `PRD.md` and
+`TICKETS.md`, which `export` turns into task files for `kage run --task-file`. Each turn reads the
+session from `.kage/shape/<slug>/`, replays only the last `shape.history_turns` exchanges beside
+the PRD and tickets, and writes the session back — so a terminal and, later, Kumo relaying a phone
+drive the same session with nothing kept alive between turns. A harness's own `--resume` would have
+been less code and the wrong design: the memory would live inside one tool, invisible to the owner
+and lost on a backend swap. The shaper never writes a file. It answers in a fixed envelope (`===
+REPLY ===` … `=== END ===`), Kage parses the *last* envelope (a streaming harness's output holds its
+drafts before its result), and a reply without one, or cut off before `END`, saves nothing — the
+remedy is always "send it again". Because Kage writes the artifacts, the shaper runs without write
+permission: `resolved_extra_args_for(Role::Shaper)` withholds the adapter's permission flags even
+when the role is spelled out, and kamui (hangs asking) and opencode (writes freely) are rejected.
+`shape.context` inlines notes by explicit entry only — a directory contributes its `README.md`,
+never its tree — because the vault it was built for tracks a `Secrets/` folder. A ticket exports only
+when `Status: ready` *and* it has a `### Definition of done` list: that list is what the planner
+turns into acceptance criteria, so "the spec must be complete" is enforced, not hoped for.
 
 **Validation runs in Kage's process, never inside an agent.** An agent reporting "tests pass" is a
 claim. An exit code is evidence.
@@ -306,6 +335,13 @@ something already fixed — and a fixed entry left here is a lie told with autho
 - **The `# Deferred Tasks` contract has not met a live planner.** The instruction, the extraction,
   and the surfacing are tested; whether real planners honour the "omit when it fits" rule is
   exactly the kind of thing a green suite cannot prove. Watch the first oversized run.
+- **The shaper has not met a live harness.** Sessions, the envelope, replay, context allowlisting,
+  and export are tested, and the whole flow was driven end to end with a `command:` shaper printing
+  a fixed envelope. Whether claude reliably answers inside the envelope, and stays read-only while
+  reading the repository, is unproven until a real session runs.
+- **A shaping turn echoes its raw output before the formatted reply.** Turns share `proc::run`'s
+  live streaming with the loop, so a passthrough shaper prints the whole envelope and then the
+  reply again. Harmless, but a chat wants only the reply.
 
 ## Where the work stands
 

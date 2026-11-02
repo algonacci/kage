@@ -37,6 +37,42 @@ pub struct Config {
     /// someone is watching and wrong for one left going overnight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify: Option<Notify>,
+    #[serde(default)]
+    pub shape: ShapeConfig,
+}
+
+/// What `kage shape` may show the shaper beyond the repository.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeConfig {
+    /// Notes inlined into every shaping prompt, relative to the project root. A directory
+    /// contributes its `README.md` only; a file contributes itself.
+    ///
+    /// An allowlist, never a whole tree. A notes vault worth reading is a vault that also holds
+    /// secrets — the one this was built for tracks a `Secrets/` folder on purpose — and everything
+    /// inlined here is sent to whichever model fills the shaper. Naming each entry keeps that a
+    /// decision rather than an accident of recursion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<String>,
+    /// How many previous turns are replayed verbatim. The PRD and tickets carry everything older;
+    /// replaying the whole conversation would grow every turn's cost without bound.
+    #[serde(default = "default_history_turns")]
+    pub history_turns: usize,
+}
+
+fn default_history_turns() -> usize {
+    6
+}
+
+/// Hand-written for the same reason as [`Validation`]: an omitted `shape:` block must replay the
+/// documented number of turns, not the zero a derived `Default` would give.
+impl Default for ShapeConfig {
+    fn default() -> Self {
+        Self {
+            context: Vec::new(),
+            history_turns: default_history_turns(),
+        }
+    }
 }
 
 fn default_version() -> u32 {
@@ -56,6 +92,10 @@ pub struct Roles {
     pub executor: RoleConfig,
     #[serde(default = "default_reviewer")]
     pub reviewer: RoleConfig,
+    /// Fills `kage shape`, not the loop. Turns a conversation into a PRD and tickets the loop can
+    /// run, so it stands before the loop rather than inside it.
+    #[serde(default = "default_shaper")]
+    pub shaper: RoleConfig,
 }
 
 impl Roles {
@@ -65,6 +105,7 @@ impl Roles {
             crate::adapters::Role::Planner => &self.planner,
             crate::adapters::Role::Executor => &self.executor,
             crate::adapters::Role::Reviewer => &self.reviewer,
+            crate::adapters::Role::Shaper => &self.shaper,
         }
     }
 }
@@ -75,6 +116,7 @@ impl Default for Roles {
             planner: default_planner(),
             executor: default_executor(),
             reviewer: default_reviewer(),
+            shaper: default_shaper(),
         }
     }
 }
@@ -89,6 +131,15 @@ fn default_executor() -> RoleConfig {
 
 fn default_reviewer() -> RoleConfig {
     RoleConfig::preset(AdapterKind::Codex)
+}
+
+/// The planner's harness, because shaping is the same kind of reading-and-deciding work. A shorter
+/// budget than a loop phase: a conversation turn that takes half an hour is not a conversation.
+fn default_shaper() -> RoleConfig {
+    RoleConfig {
+        timeout_secs: 900,
+        ..RoleConfig::preset(AdapterKind::ClaudeCode)
+    }
 }
 
 /// Which harness fills a role, and how to invoke it.
@@ -171,6 +222,20 @@ impl RoleConfig {
             .clone()
             .unwrap_or_else(|| self.adapter.default_extra_args())
     }
+
+    /// The flags appended when this config fills `role`.
+    ///
+    /// The shaper gets none of the write permissions by default. Kage writes every shaping artifact
+    /// from the reply, so the harness only needs to read — and a harness left without its write
+    /// flag cannot edit the repository while someone is merely talking about it. `claude --print`
+    /// denies writes on its own and codex's default sandbox is read-only, so withholding the flags
+    /// is the whole mechanism; no read-only flag is guessed at.
+    pub fn resolved_extra_args_for(&self, role: crate::adapters::Role) -> Vec<String> {
+        if role == crate::adapters::Role::Shaper {
+            return self.extra_args.clone().unwrap_or_default();
+        }
+        self.resolved_extra_args()
+    }
 }
 
 impl Config {
@@ -193,10 +258,27 @@ impl Config {
                 .to_string());
         }
 
+        // Without its permission flag kamui stops to ask before every tool call and hangs; opencode
+        // edits without asking at all, so withholding flags cannot make it read-only. Either would
+        // break the promise that talking about a change never makes one.
+        if matches!(
+            self.roles.shaper.adapter,
+            AdapterKind::Kamui | AdapterKind::OpenCode
+        ) {
+            return Err(format!(
+                "the shaper cannot use `adapter: {}`\n\
+                 shaping must not edit the repository, and that harness cannot be run read-only \
+                 without stopping for approval or writing freely\n\
+                 use claude-code, codex, or an `api` provider for `roles.shaper`",
+                self.roles.shaper.adapter
+            ));
+        }
+
         for (role, config) in [
             ("planner", &self.roles.planner),
             ("executor", &self.roles.executor),
             ("reviewer", &self.roles.reviewer),
+            ("shaper", &self.roles.shaper),
         ] {
             if config.adapter != AdapterKind::Api {
                 continue;
@@ -786,6 +868,80 @@ mod tests {
                 .get("parse_mode")
                 .is_some_and(|value| value.is_null())
         );
+    }
+
+    #[test]
+    fn the_shaper_defaults_to_claude_without_its_write_permission() {
+        // Shaping reads and talks; Kage writes every artifact from the reply. `claude --print`
+        // without `--permission-mode acceptEdits` denies writes, so withholding the flag is what
+        // keeps a conversation from editing the repository.
+        let config: Config = serde_yaml_ng::from_str("{}").unwrap();
+
+        assert_eq!(config.roles.shaper.adapter, AdapterKind::ClaudeCode);
+        assert_eq!(config.roles.shaper.timeout_secs, 900);
+        assert!(
+            config
+                .roles
+                .shaper
+                .resolved_extra_args_for(crate::adapters::Role::Shaper)
+                .is_empty()
+        );
+        assert_eq!(
+            config
+                .roles
+                .planner
+                .resolved_extra_args_for(crate::adapters::Role::Planner),
+            vec!["--permission-mode".to_string(), "acceptEdits".to_string()],
+            "the loop's roles keep their flags"
+        );
+    }
+
+    #[test]
+    fn a_shaper_spelled_out_in_yaml_still_gets_no_write_flag() {
+        // The trap `extra_args` already fell into once: naming the adapter must not quietly bring
+        // the adapter's defaults back.
+        let config: Config =
+            serde_yaml_ng::from_str("roles:\n  shaper:\n    adapter: claude-code\n").unwrap();
+
+        assert!(
+            config
+                .roles
+                .shaper
+                .resolved_extra_args_for(crate::adapters::Role::Shaper)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_shaper_that_cannot_run_read_only_is_rejected() {
+        for adapter in ["kamui", "opencode"] {
+            let config: Config =
+                serde_yaml_ng::from_str(&format!("roles:\n  shaper:\n    adapter: {adapter}\n"))
+                    .unwrap();
+
+            let error = config.validate().unwrap_err();
+            assert!(error.contains("shaper cannot use"), "{error}");
+            assert!(
+                error.contains("claude-code"),
+                "the remedy names a way out: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shaper_may_be_backed_by_an_endpoint() {
+        let config = api_config("shaper", "    provider: orvix\n    model: m\n");
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn an_omitted_shape_block_still_replays_recent_turns() {
+        // The same trap as `setup:` and `validation:`: a derived Default would replay zero turns.
+        let config: Config = serde_yaml_ng::from_str("{}").unwrap();
+
+        assert_eq!(config.shape.history_turns, 6);
+        assert!(config.shape.context.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Command implementations.
 
 pub mod doctor;
+pub mod shape;
 pub mod status;
 
 use std::path::{Path, PathBuf};

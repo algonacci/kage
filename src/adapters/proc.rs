@@ -928,8 +928,12 @@ mod tests {
     async fn quotes_inside_a_shell_command_survive() {
         // Regression guard: per-argument escaping used to split this into `\"assert` and the rest,
         // so every validation command containing quotes failed with a syntax error.
+        //
+        // git rather than python: Kage already requires git, while `python` is absent from a stock
+        // macOS and this test failed there for a missing interpreter, not a quoting bug. A mangled
+        // quote splits the value into separate arguments and git rejects them.
         let outcome = run(shell_spawn(
-            "python -c \"print('inner-quotes-intact')\"",
+            "git -c \"kage.probe=inner-quotes intact\" config --get kage.probe",
             std::env::temp_dir(),
             Duration::from_secs(60),
         ))
@@ -938,7 +942,7 @@ mod tests {
 
         assert!(outcome.success(), "{outcome:?}");
         assert!(
-            outcome.stdout.contains("inner-quotes-intact"),
+            outcome.stdout.contains("inner-quotes intact"),
             "{outcome:?}"
         );
     }

@@ -8,7 +8,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::adapters::{preflight, proc};
+use crate::adapters::{Role, preflight, proc};
 use crate::config::{AdapterKind, Config, Notify, Project, RoleConfig};
 
 const CHECK: &str = "\u{2713}";
@@ -45,6 +45,9 @@ pub async fn run(cwd: &Path) -> Result<()> {
     if let Some(config) = &config {
         println!("Roles");
         for status in preflight::inspect(&config.roles) {
+            // The shaper serves `kage shape`, never a run, so a missing one is reported without
+            // calling the project unready to run.
+            let required = status.role != Role::Shaper;
             let model = status
                 .config
                 .model
@@ -57,6 +60,11 @@ pub async fn run(cwd: &Path) -> Result<()> {
             // command exists to catch before a run pays for a planner.
             if status.config.adapter == AdapterKind::Api {
                 let (mark, detail) = api_role_status(config, status.config);
+                let mark = if mark == CROSS && !required {
+                    CIRCLE
+                } else {
+                    mark
+                };
                 println!("{mark} {}  api{model}", status.role);
                 println!("    {detail}");
 
@@ -66,15 +74,23 @@ pub async fn run(cwd: &Path) -> Result<()> {
                 continue;
             }
 
-            let mark = if status.found() { CHECK } else { CROSS };
+            let mark = match (status.found(), required) {
+                (true, _) => CHECK,
+                (false, true) => CROSS,
+                (false, false) => CIRCLE,
+            };
             println!("{mark} {}  {}{model}", status.role, status.config.adapter);
             println!(
                 "    `{}`{}",
                 status.program,
-                if status.found() { "" } else { "  not found" }
+                match (status.found(), required) {
+                    (true, _) => "",
+                    (false, true) => "  not found",
+                    (false, false) => "  not found — needed only by `kage shape`",
+                }
             );
 
-            if !status.found() {
+            if !status.found() && required {
                 required_missing.push(status.label());
             }
         }

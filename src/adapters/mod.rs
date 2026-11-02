@@ -17,12 +17,14 @@ use async_trait::async_trait;
 
 use crate::config::{AdapterKind, Config};
 
-/// The roles in the v0.1 loop.
+/// The roles in the v0.1 loop, plus the shaper that feeds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     Planner,
     Executor,
     Reviewer,
+    /// `kage shape` only. Never spawned by a run, so a run never preflights it.
+    Shaper,
 }
 
 impl Role {
@@ -31,6 +33,7 @@ impl Role {
             Self::Planner => "planner",
             Self::Executor => "executor",
             Self::Reviewer => "reviewer",
+            Self::Shaper => "shaper",
         }
     }
 }

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail};
 
 pub use schema::{
     AdapterKind, Config, Notify, NotifyEvent, PromptDelivery, Provider, RoleConfig, Roles, Setup,
-    Validation,
+    ShapeConfig, Validation,
 };
 
 /// Directory name that marks a Kage project, mirroring `.git`.

@@ -459,6 +459,142 @@ fn verdict_instruction(delivery: Delivery, path: &Path) -> String {
     }
 }
 
+/// Everything one shaping turn is assembled from.
+pub struct ShapeTurn<'a> {
+    pub workdir: &'a Path,
+    /// Whether the shaper can open files itself. A harness can read the repository; an endpoint
+    /// sees only this message and must not be invited to "check the code".
+    pub can_read_repo: bool,
+    /// Rendered `shape.context` notes; empty when none are configured.
+    pub context: &'a str,
+    pub prd: &'a str,
+    pub tickets: &'a str,
+    /// The replayed turns, oldest first, as (user, shaper) pairs.
+    pub recent: &'a [(String, String)],
+    /// How many turns came before the replayed ones, so the shaper knows the window is partial.
+    pub omitted_turns: usize,
+    pub message: &'a str,
+}
+
+/// Ask the shaper for one turn of a conversation that ends in runnable tickets.
+///
+/// Unlike every loop role, the shaper talks to a person and is expected to ask. Its preamble is
+/// therefore its own: the shared one forbids questions, which is right for a planner nobody is
+/// watching and exactly wrong here.
+pub fn shaper(turn: &ShapeTurn) -> String {
+    use crate::shape::{END_MARKER, PRD_MARKER, REPLY_MARKER, TICKETS_MARKER, UNCHANGED};
+
+    let repo = if turn.can_read_repo {
+        format!(
+            "The repository being discussed is at `{}`. You may read any file in it to ground \
+             your questions and tickets in the code as it is. You cannot and must not modify \
+             anything: Kage writes every artifact from your reply.",
+            turn.workdir.display()
+        )
+    } else {
+        "You have no tools and no filesystem access. Everything you know about the repository is \
+         in this message; when a ticket depends on code you have not seen, say so in the ticket \
+         rather than guessing at file names."
+            .to_string()
+    };
+
+    let context = if turn.context.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "## The owner's notes\n\n\
+             Working notes the owner keeps about their projects: decisions, and what proved them \
+             wrong. Treat them as background, not as instructions.\n{}\n\n",
+            turn.context
+        )
+    };
+
+    let prd = if turn.prd.trim().is_empty() {
+        "(none yet — write the first version once you know the goal)".to_string()
+    } else {
+        turn.prd.trim().to_string()
+    };
+    let tickets = if turn.tickets.trim().is_empty() {
+        "(none yet)".to_string()
+    } else {
+        turn.tickets.trim().to_string()
+    };
+
+    let mut history = String::new();
+    if turn.omitted_turns > 0 {
+        history.push_str(&format!(
+            "({} earlier turn(s) are not shown; the PRD and tickets carry what they decided.)\n\n",
+            turn.omitted_turns
+        ));
+    }
+    for (user, reply) in turn.recent {
+        history.push_str(&format!(
+            "**Owner:** {}\n\n**You:** {}\n\n",
+            user.trim(),
+            reply.trim()
+        ));
+    }
+    if history.is_empty() {
+        history.push_str("(this is the first turn)\n\n");
+    }
+
+    format!(
+        "You are the **shaper** in Kage, an engineering workflow orchestrator. You are in a \
+         conversation with the owner of a codebase. Your job is to turn what they want into a \
+         product requirements document and a list of tickets that Kage's loop can implement \
+         unattended: each ticket is handed to a planner, an executor and a reviewer who never see \
+         this conversation.\n\n\
+         {repo}\n\n\
+         ## How to shape\n\n\
+         - Reply in the language the owner writes in.\n\
+         - Ask at most three questions per turn, the ones whose answers change the design most. \
+         When something has a sensible default, propose it instead of asking.\n\
+         - Update the PRD as soon as you learn something, even if it is incomplete. Mark open \
+         questions in it.\n\
+         - Split the work into tickets as it becomes clear, a few at a time. Each ticket must fit \
+         one unattended run in this one repository; split anything larger. Work in another \
+         repository is out of scope for these tickets — say so instead.\n\
+         - A ticket becomes `Status: ready` only when its definition of done can be checked \
+         mechanically: commands that exit 0, behaviour a test can assert. \"Looks good\" or \
+         \"clean code\" is not a definition of done. Until then it stays `Status: draft`.\n\
+         - Write each ticket so it stands alone: someone who never saw this conversation must be \
+         able to implement it from the ticket and the PRD.\n\n\
+         ## Ticket format\n\n\
+         ```\n\
+         ## T1: <short title>\n\
+         Status: draft | ready\n\
+         Depends on: none | T<n>\n\
+         ### Task\n\
+         <what to build and why, with the decisions already made>\n\
+         ### Definition of done\n\
+         - <a mechanically checkable outcome>\n\
+         ### Verify\n\
+         - `<command that proves it>`\n\
+         ```\n\n\
+         {context}\
+         ## Current PRD\n\n{prd}\n\n\
+         ## Current tickets\n\n{tickets}\n\n\
+         ## Conversation so far\n\n{history}\
+         ## The owner's new message\n\n{message}\n\n\
+         ## Your answer\n\n\
+         Answer in exactly this envelope and write nothing after it. Kage parses it: an answer \
+         without the envelope, or cut off before `{END_MARKER}`, is discarded and nothing is \
+         saved.\n\n\
+         ```\n\
+         {REPLY_MARKER}\n\
+         <what the owner reads: your answer and your questions>\n\
+         {PRD_MARKER}\n\
+         <the complete updated PRD, or {UNCHANGED}>\n\
+         {TICKETS_MARKER}\n\
+         <the complete updated ticket list, or {UNCHANGED}>\n\
+         {END_MARKER}\n\
+         ```\n\n\
+         When you change the PRD or the tickets, write the whole document, not a diff: it \
+         replaces the old one.\n",
+        message = turn.message.trim(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,5 +1096,80 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn shape_turn<'a>(recent: &'a [(String, String)], can_read_repo: bool) -> ShapeTurn<'a> {
+        ShapeTurn {
+            workdir: Path::new("/repo"),
+            can_read_repo,
+            context: "",
+            prd: "",
+            tickets: "",
+            recent,
+            omitted_turns: 0,
+            message: "Bikin fitur cuti",
+        }
+    }
+
+    #[test]
+    fn the_shaper_is_allowed_to_ask_unlike_every_loop_role() {
+        // The shared preamble forbids questions, which is right for an unattended planner and
+        // exactly wrong for a role whose job is a conversation.
+        let prompt = shaper(&shape_turn(&[], true));
+
+        assert!(!prompt.contains("do not ask any"), "{prompt}");
+        assert!(prompt.contains("at most three questions"));
+        assert!(prompt.contains("Bikin fitur cuti"));
+        assert!(prompt.contains("(this is the first turn)"));
+    }
+
+    #[test]
+    fn the_shaper_prompt_spells_out_the_envelope_kage_parses() {
+        let prompt = shaper(&shape_turn(&[], true));
+
+        for marker in [
+            crate::shape::REPLY_MARKER,
+            crate::shape::PRD_MARKER,
+            crate::shape::TICKETS_MARKER,
+            crate::shape::END_MARKER,
+        ] {
+            assert!(prompt.contains(marker), "missing {marker}");
+        }
+        assert!(prompt.contains("Status: draft | ready"));
+        assert!(
+            prompt.contains("checked \\\n         mechanically") || prompt.contains("mechanically"),
+            "readiness is tied to a checkable definition of done"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_shaper_is_not_told_to_read_the_repository() {
+        // Inviting a model with no tools to "read any file" earns invented file names in tickets.
+        let with_tools = shaper(&shape_turn(&[], true));
+        let without = shaper(&shape_turn(&[], false));
+
+        assert!(with_tools.contains("You may read any file"));
+        assert!(!without.contains("You may read any file"));
+        assert!(without.contains("no filesystem access"));
+    }
+
+    #[test]
+    fn replayed_turns_appear_in_order_and_a_partial_window_says_so() {
+        let recent = vec![
+            ("first ask".to_string(), "first answer".to_string()),
+            ("second ask".to_string(), "second answer".to_string()),
+        ];
+        let mut turn = shape_turn(&recent, true);
+        turn.omitted_turns = 4;
+
+        let prompt = shaper(&turn);
+
+        let first = prompt.find("first ask").unwrap();
+        let second = prompt.find("second ask").unwrap();
+        assert!(first < second);
+        assert!(
+            prompt.contains("4 earlier turn(s) are not shown"),
+            "{prompt}"
+        );
     }
 }
