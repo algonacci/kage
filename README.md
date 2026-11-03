@@ -176,6 +176,9 @@ loop:
   # Attempts to make validation pass before each review. A broken build spends
   # these, never a review cycle — the two failures are different in kind.
   max_repairs: 3
+  # A harness that hits its usage limit ("resets 1:10am") is waited for and asked
+  # again, up to this long in total per phase. 0 fails at once.
+  limit_wait_secs: 21600
 
 git:
   isolate: true

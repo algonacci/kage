@@ -53,6 +53,7 @@ src/
 ├── adapters/
 │   ├── mod.rs           AgentAdapter trait, Role, the role -> backend seam
 │   ├── cli.rs           spawning coding-agent CLIs; per-harness argv presets
+│   ├── limits.rs        reading a harness's usage-limit notice and when it resets
 │   ├── api.rs           an HTTP endpoint filling a role, for planner and reviewer only
 │   ├── preflight.rs     resolve every role's program before a run spends anything
 │   ├── proc.rs          all process spawning: capture, timeout, PATH, rtk routing, live logs, heartbeat
@@ -139,6 +140,16 @@ exactly like this, and it used to bill its entire timeout before anything said s
 the same bounded kill/reap/drain path as a timeout but is reported apart, because the remedies
 differ: a timeout wants a bigger budget, a stall wants to know why the harness went quiet.
 Validation commands and git are exempt — a compiler is legitimately silent for minutes.
+
+**A spent usage window is waited out, not failed.** The first overnight queue died at its third
+ticket on claude's `You've hit your 5-hour limit · resets 1:10am` and sat idle until morning, when
+all it needed was to wait. `run_agent` reads the reset time from the tail of a failed phase's
+output (`adapters/limits.rs`), sleeps until then, and asks the same phase again — a half-done
+executor finds its own work on disk, as a resume would show it. The total wait per phase is
+bounded by `loop.limit_wait_secs` (six hours; `0` restores failing at once), and a notice that
+names no readable time fails as before: opencode's free tier says "limit reached" with no reset,
+and waiting on it would only burn the night. The stated time is read as local, because the harness
+reports the clock of the machine it runs on.
 
 **The raw transcript is never filtered; a streaming phase gets a rendered twin instead.**
 `<label>.log` keeps every raw line — it once held the only surviving copy of a plan — but a claude

@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod cli;
+pub mod limits;
 pub mod preflight;
 pub mod proc;
 pub mod stream;

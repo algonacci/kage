@@ -527,6 +527,11 @@ pub struct LoopConfig {
     /// implementation job with the same right to a compiling result.
     #[serde(default = "default_max_repairs")]
     pub max_repairs: usize,
+    /// How long, in total, a run may wait for a harness's usage limit to reset before it fails.
+    /// A subscription window refills on its own; a queue left overnight should sleep through it
+    /// rather than stop. `0` fails at once, as before.
+    #[serde(default = "default_limit_wait_secs")]
+    pub limit_wait_secs: u64,
 }
 
 fn default_max_iterations() -> usize {
@@ -537,11 +542,17 @@ fn default_max_repairs() -> usize {
     3
 }
 
+/// Six hours: one five-hour window, the longest a subscription harness asks for, with slack.
+fn default_limit_wait_secs() -> u64 {
+    6 * 60 * 60
+}
+
 impl Default for LoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: default_max_iterations(),
             max_repairs: default_max_repairs(),
+            limit_wait_secs: default_limit_wait_secs(),
         }
     }
 }

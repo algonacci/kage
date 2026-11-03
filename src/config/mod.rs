@@ -220,6 +220,9 @@ fn starter_config(root: &Path) -> String {
          \x20 # Attempts to make validation pass before each review; a broken build\n\
          \x20 # spends these, never a review cycle.\n\
          \x20 max_repairs: 3\n\
+         \x20 # When a harness hits its usage limit, wait up to this long for the\n\
+         \x20 # reset it names, then carry on. 0 fails at once.\n\
+         \x20 limit_wait_secs: 21600\n\
          \n\
          git:\n\
          \x20 # Run agents in a throwaway worktree instead of your working tree.\n\

@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 
-use crate::adapters::{self, AgentAdapter, AgentRequest, Role, preflight};
+use crate::adapters::{self, AgentAdapter, AgentRequest, Role, limits, preflight};
 use crate::config::{Config, Project};
 use crate::engine::{gates, prompts, runner};
 use crate::git;
@@ -405,7 +405,15 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 let delivery = prompts::Delivery::from_adapter(planner.writes_own_artifacts());
                 let prompt = prompts::planner(&state.task, &state.workdir, &artifacts, delivery);
 
-                let result = run_agent(&*planner, &state, &artifacts, "planner", prompt).await?;
+                let result = run_agent(
+                    &*planner,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    "planner",
+                    prompt,
+                )
+                .await?;
                 if let Some(reason) = agent_failure(&result, "planner") {
                     return fail(project, state, reason);
                 }
@@ -451,7 +459,15 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 let delivery = prompts::Delivery::from_adapter(executor.writes_own_artifacts());
                 let prompt = prompts::executor(&state.workdir, &artifacts, brief(&state), delivery);
 
-                let result = run_agent(&*executor, &state, &artifacts, "executor", prompt).await?;
+                let result = run_agent(
+                    &*executor,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    "executor",
+                    prompt,
+                )
+                .await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
                     return fail(project, state, reason);
                 }
@@ -461,8 +477,14 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 if let Err(error) = save_reply(delivery, &result, &artifacts.execution()) {
                     return fail(project, state, format!("{error:#}"));
                 }
-                if let Some(reason) =
-                    ensure_account(&*executor, &state, &artifacts, "executor").await?
+                if let Some(reason) = ensure_account(
+                    &*executor,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    "executor",
+                )
+                .await?
                 {
                     return fail(project, state, reason);
                 }
@@ -516,8 +538,14 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 // phase directly, and a resumed run whose worktree was recreated has none of its
                 // artifacts in it — `.kage/` is never committed. On the normal path this is a file
                 // check and costs nothing.
-                if let Some(reason) =
-                    ensure_account(&*executor, &state, &artifacts, "review").await?
+                if let Some(reason) = ensure_account(
+                    &*executor,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    "review",
+                )
+                .await?
                 {
                     return fail(project, state, reason);
                 }
@@ -532,7 +560,15 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                 let delivery = prompts::Delivery::from_adapter(reviewer.writes_own_artifacts());
                 let prompt =
                     prompts::reviewer(&state.workdir, &artifacts, brief(&state), &diff, delivery);
-                let result = run_agent(&*reviewer, &state, &artifacts, "reviewer", prompt).await?;
+                let result = run_agent(
+                    &*reviewer,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    "reviewer",
+                    prompt,
+                )
+                .await?;
                 if let Some(reason) = agent_failure(&result, "reviewer") {
                     return fail(project, state, reason);
                 }
@@ -651,14 +687,29 @@ async fn run_phases(project: &Project, config: &Config, mut state: RunState) -> 
                         format!("repair-{}-{}", state.iteration, state.repairs)
                     }
                 };
-                let result = run_agent(&*executor, &state, &artifacts, &label, prompt).await?;
+                let result = run_agent(
+                    &*executor,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    &label,
+                    prompt,
+                )
+                .await?;
                 if let Some(reason) = agent_failure(&result, "executor") {
                     return fail(project, state, reason);
                 }
                 if let Err(error) = save_reply(delivery, &result, &artifacts.execution()) {
                     return fail(project, state, format!("{error:#}"));
                 }
-                if let Some(reason) = ensure_account(&*executor, &state, &artifacts, &label).await?
+                if let Some(reason) = ensure_account(
+                    &*executor,
+                    config.loop_config.limit_wait_secs,
+                    &state,
+                    &artifacts,
+                    &label,
+                )
+                .await?
                 {
                     return fail(project, state, reason);
                 }
@@ -760,6 +811,7 @@ fn missing_account_reason(log: &str) -> String {
 /// code is committed to the run's branch and `outcome_hint` prints where it is.
 async fn ensure_account(
     executor: &dyn AgentAdapter,
+    limit_wait_secs: u64,
     state: &RunState,
     artifacts: &Artifacts,
     label: &str,
@@ -778,7 +830,7 @@ async fn ensure_account(
     let prompt = prompts::account(&state.workdir, artifacts, brief(state), &diff, delivery);
 
     let label = account_label(label);
-    let result = run_agent(executor, state, artifacts, &label, prompt).await?;
+    let result = run_agent(executor, limit_wait_secs, state, artifacts, &label, prompt).await?;
     let log = artifacts.logs_dir().join(format!("{label}.log"));
 
     if let Some(detail) = agent_failure(&result, "executor") {
@@ -928,6 +980,7 @@ fn agent_failure(result: &crate::adapters::AgentResult, role: &str) -> Option<St
 
 async fn run_agent(
     adapter: &dyn AgentAdapter,
+    limit_wait_secs: u64,
     state: &RunState,
     artifacts: &Artifacts,
     label: &str,
@@ -955,16 +1008,48 @@ async fn run_agent(
         progress.as_deref().unwrap_or(&log_path).display()
     );
 
-    adapter
-        .run(AgentRequest {
-            prompt,
-            prompt_file: artifacts.prompts_dir().join(format!("{label}.md")),
-            workdir: state.workdir.clone(),
-            log_path,
-            label: label.to_string(),
-            echo: true,
-        })
-        .await
+    // A spent usage window is waited out, not failed: the harness names when it refills, and an
+    // overnight queue that stopped at the first limit sat idle until morning for want of a
+    // `kage resume`. The same phase is simply asked again — a half-done executor finds its own
+    // work on disk, the way a resume would show it.
+    let mut waited = 0u64;
+    loop {
+        let result = adapter
+            .run(AgentRequest {
+                prompt: prompt.clone(),
+                prompt_file: artifacts.prompts_dir().join(format!("{label}.md")),
+                workdir: state.workdir.clone(),
+                log_path: log_path.clone(),
+                label: label.to_string(),
+                echo: true,
+            })
+            .await?;
+        if result.success() {
+            return Ok(result);
+        }
+        let now = chrono::Local::now().naive_local();
+        let Some(reset) = limits::reset_after(&result.stdout, &result.stderr, now) else {
+            return Ok(result);
+        };
+        let wait = (reset - now).num_seconds().max(0) as u64;
+        if waited + wait > limit_wait_secs {
+            println!(
+                "  [{label}] usage limit resets at {} — past the {}s `loop.limit_wait_secs` budget, \
+                 so the run stops; `kage resume {}` after then",
+                reset.format("%H:%M"),
+                limit_wait_secs,
+                state.id
+            );
+            return Ok(result);
+        }
+        println!(
+            "  [{label}] usage limit — waiting until {} ({}), then asking again",
+            reset.format("%H:%M"),
+            adapters::stream::brief_duration(std::time::Duration::from_secs(wait))
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        waited += wait;
+    }
 }
 
 fn banner(state: &RunState, phase: &str, who: &str) {
@@ -1774,6 +1859,83 @@ mod tests {
             "the re-ask is bookkeeping, not a fix attempt"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Answers each call with the next scripted result, counting the calls.
+    struct Scripted {
+        results: std::sync::Mutex<Vec<crate::adapters::AgentResult>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentAdapter for Scripted {
+        async fn run(&self, _request: AgentRequest) -> Result<crate::adapters::AgentResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.results.lock().unwrap().remove(0))
+        }
+
+        fn describe(&self) -> String {
+            "scripted".to_string()
+        }
+    }
+
+    fn exited(code: i32, stdout: &str) -> crate::adapters::AgentResult {
+        crate::adapters::AgentResult {
+            code: Some(code),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            timed_out: false,
+            stalled: false,
+            duration_secs: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_spent_usage_window_is_waited_out_and_the_phase_asked_again() {
+        // The Omniflow-CRM queue died at its third ticket on "You've hit your 5-hour limit ·
+        // resets 1:10am" and sat idle until morning, when all it needed was to wait.
+        let root = std::env::temp_dir().join(format!("kage-wf-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        crate::config::init(&root, true).unwrap();
+        let project = Project::discover(&root).unwrap();
+        let state = RunState::new("run_limit".to_string(), "t".to_string(), root.clone(), 1);
+        let artifacts = Artifacts::new(&project, &state.id);
+        let notice = "You've hit your usage limit · resets in 0 minutes";
+
+        let retried = Scripted {
+            results: std::sync::Mutex::new(vec![exited(1, notice), exited(0, "ok")]),
+            calls: Default::default(),
+        };
+        let result = run_agent(&retried, 60, &state, &artifacts, "planner", "p".to_string())
+            .await
+            .unwrap();
+        assert!(result.success());
+        assert_eq!(retried.calls.into_inner(), 2);
+
+        let disabled = Scripted {
+            results: std::sync::Mutex::new(vec![exited(1, "You've hit your limit · resets in 5m")]),
+            calls: Default::default(),
+        };
+        let result = run_agent(&disabled, 0, &state, &artifacts, "planner", "p".to_string())
+            .await
+            .unwrap();
+        assert!(!result.success(), "a wait past the budget fails as before");
+        assert_eq!(disabled.calls.into_inner(), 1);
+
+        let other = Scripted {
+            results: std::sync::Mutex::new(vec![exited(1, "error: model not found")]),
+            calls: Default::default(),
+        };
+        run_agent(&other, 60, &state, &artifacts, "planner", "p".to_string())
+            .await
+            .unwrap();
+        assert_eq!(
+            other.calls.into_inner(),
+            1,
+            "an ordinary failure is never retried"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
