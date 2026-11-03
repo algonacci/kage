@@ -88,7 +88,10 @@ pub async fn run(cwd: &Path, options: QueueOptions) -> Result<()> {
             ..Options::default()
         };
 
-        match super::start(&project, &config, &task, &run_options).await {
+        let stacked = tickets
+            .get(index + 1)
+            .is_some_and(|next| next.group == ticket.group);
+        match super::start(&project, &config, &task, &run_options, stacked).await {
             Ok(state) => {
                 ledger.record(&ticket.name, &state.id);
                 ledger.save(&project)?;

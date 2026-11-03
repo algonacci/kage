@@ -73,7 +73,7 @@ pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
         ),
     }
 
-    let state = start(&project, &config, task, &options).await?;
+    let state = start(&project, &config, task, &options, false).await?;
     let hand_over = finish::for_run(&project, &state);
     conclude(&project, &config, &state, hand_over.as_ref()).await;
     exit_for(&state)
@@ -83,12 +83,14 @@ pub async fn run(cwd: &Path, task: &str, options: Options) -> Result<()> {
 ///
 /// Shared by `kage run` and the queue so a queued ticket is reported exactly as a typed one would
 /// be — the queue adds order, never a second way of finishing a run. Concluding is the caller's
-/// because only the caller knows whether this run's branch is the one to hand over.
+/// because only the caller knows whether this run's branch is the one to hand over — and `stacked`
+/// is the caller's for the same reason: only the queue knows a later ticket builds on this one.
 pub(crate) async fn start(
     project: &Project,
     config: &Config,
     task: &str,
     options: &Options,
+    stacked: bool,
 ) -> Result<RunState> {
     let state = match workflow::start(project, config, task, options).await {
         Ok(state) => state,
@@ -98,7 +100,7 @@ pub(crate) async fn start(
             return Err(error);
         }
     };
-    report(&state);
+    report(&state, stacked);
     Ok(state)
 }
 
@@ -148,10 +150,11 @@ pub async fn resume(cwd: &Path, run_id: Option<&str>) -> Result<()> {
             return Err(error);
         }
     };
-    report(&state);
     // A queued ticket with a later sibling is not handed over: the next ticket stacks on its
     // branch, and the session's pull request comes from the last one.
-    let hand_over = match queue::hand_over_for(&project, &state) {
+    let place = queue::hand_over_for(&project, &state);
+    report(&state, matches!(place, queue::Place::Stacked));
+    let hand_over = match place {
         queue::Place::NotQueued => finish::for_run(&project, &state),
         queue::Place::Stacked => None,
         queue::Place::Tip(hand_over) => hand_over,
@@ -249,7 +252,7 @@ pub async fn clean(cwd: &Path, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn report(state: &RunState) {
+fn report(state: &RunState, stacked: bool) {
     println!("\n{}", "-".repeat(60));
     println!("Run {} finished: {}", state.id, state.phase);
 
@@ -264,7 +267,7 @@ fn report(state: &RunState) {
     // A failed or blocked run may still have produced work worth recovering, so every terminal
     // phase says where it went; `outcome_hint` handles all of them.
     if state.phase.is_terminal() {
-        println!("\n{}", workflow::outcome_hint(state));
+        println!("\n{}", workflow::outcome_hint(state, stacked));
     }
 
     println!("\nDetails:  kage status {}", state.id);

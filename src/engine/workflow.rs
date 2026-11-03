@@ -1078,7 +1078,11 @@ fn block(project: &Project, mut state: RunState, reason: String) -> Result<RunSt
 }
 
 /// Where the finished work ended up, for the closing summary.
-pub fn outcome_hint(state: &RunState) -> String {
+///
+/// `stacked` is a queued ticket a later ticket builds on. Its branch is not for merging: the next
+/// ticket's branch already holds it, so "take them with: git merge" sent the first person to
+/// resume a queued ticket off to merge a branch mid-chain instead of carrying the queue on.
+pub fn outcome_hint(state: &RunState, stacked: bool) -> String {
     let base = state.base_commit.as_deref().unwrap_or("HEAD");
     match &state.worktree {
         None => format!("changes were made in place at {}", state.workdir.display()),
@@ -1090,10 +1094,16 @@ pub fn outcome_hint(state: &RunState) -> String {
                 ..
             }) => format!(
                 "{} file(s) committed as {} on branch `{branch}`\n  \
-                 review them with:  git diff {base} {branch}\n  \
-                 take them with:    git merge {branch}",
+                 review them with:  git diff {base} {branch}\n  {}",
                 files_changed,
                 sha.chars().take(12).collect::<String>(),
+                if stacked {
+                    "a later ticket stacks on this branch, so don't merge it — carry on with:  \
+                     kage queue"
+                        .to_string()
+                } else {
+                    format!("take them with:    git merge {branch}")
+                },
             ),
             Some(Commitment::NothingToCommit { branch }) => {
                 format!("no changes were made — branch `{branch}` is unchanged")
@@ -1559,11 +1569,17 @@ mod tests {
             created: true,
         });
 
-        let hint = outcome_hint(&state);
+        let hint = outcome_hint(&state, false);
 
         assert!(hint.contains("0123456789ab"), "{hint}");
         assert!(hint.contains("git diff abc123"), "{hint}");
         assert!(hint.contains("git merge kage/run_1"), "{hint}");
+
+        // A resumed Omniflow-CRM ticket was told to `git merge` its branch mid-chain, when the
+        // next ticket stacks on it and the move was `kage queue`.
+        let stacked = outcome_hint(&state, true);
+        assert!(!stacked.contains("git merge"), "{stacked}");
+        assert!(stacked.contains("kage queue"), "{stacked}");
     }
 
     #[test]
@@ -1578,7 +1594,7 @@ mod tests {
             branch: "kage/run_1".to_string(),
         });
 
-        let hint = outcome_hint(&state);
+        let hint = outcome_hint(&state, false);
 
         assert!(hint.contains("no changes were made"), "{hint}");
         assert!(!hint.contains("git merge"), "{hint}");
@@ -1595,7 +1611,7 @@ mod tests {
             reason: "git refused".to_string(),
         });
 
-        let hint = outcome_hint(&state);
+        let hint = outcome_hint(&state, false);
 
         assert!(hint.contains("/tmp/wt"), "{hint}");
         assert!(hint.contains("git refused"), "{hint}");
@@ -1606,7 +1622,7 @@ mod tests {
     fn a_run_without_a_worktree_still_reports_changes_in_place() {
         let state = state(3);
 
-        let hint = outcome_hint(&state);
+        let hint = outcome_hint(&state, false);
 
         assert!(hint.contains("changes were made in place"), "{hint}");
     }

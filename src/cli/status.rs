@@ -125,7 +125,11 @@ fn detail(project: &Project, state: &RunState) -> Result<()> {
         }
     }
 
-    println!("\n{}", next_step(state));
+    let stacked = matches!(
+        super::queue::hand_over_for(project, state),
+        super::queue::Place::Stacked
+    );
+    println!("\n{}", next_step(state, stacked));
     Ok(())
 }
 
@@ -144,19 +148,19 @@ fn artifact_note(label: &str, exists: bool, skip_plan: bool) -> String {
 ///
 /// A phase name alone puts the burden of knowing the state machine on the reader; a run that
 /// stopped is only useful if the next move is obvious.
-fn next_step(state: &RunState) -> String {
+fn next_step(state: &RunState, stacked: bool) -> String {
     match state.phase {
-        Phase::Completed => format!("Completed. {}", workflow::outcome_hint(state)),
+        Phase::Completed => format!("Completed. {}", workflow::outcome_hint(state, stacked)),
         Phase::Failed => format!(
             "Failed. Inspect the logs in the run directory, then retry with:  kage resume {}\n{}",
             state.id,
-            workflow::outcome_hint(state)
+            workflow::outcome_hint(state, stacked)
         ),
         Phase::Blocked => format!(
             "Blocked — this needs a human decision. Read REVIEW.md, then either fix the plan and \
              run `kage resume {}`, or start a new run with a clearer task.\n{}",
             state.id,
-            workflow::outcome_hint(state)
+            workflow::outcome_hint(state, stacked)
         ),
         _ => format!(
             "Interrupted while `{}`. Continue with:  kage resume {}",
@@ -191,10 +195,10 @@ mod tests {
 
     #[test]
     fn every_stopped_phase_suggests_a_concrete_next_command() {
-        assert!(next_step(&state(Phase::Planning)).contains("kage resume run_20260809_001"));
-        assert!(next_step(&state(Phase::Failed)).contains("kage resume"));
-        assert!(next_step(&state(Phase::Blocked)).contains("human"));
-        assert!(next_step(&state(Phase::Completed)).contains("Completed"));
+        assert!(next_step(&state(Phase::Planning), false).contains("kage resume run_20260809_001"));
+        assert!(next_step(&state(Phase::Failed), false).contains("kage resume"));
+        assert!(next_step(&state(Phase::Blocked), false).contains("human"));
+        assert!(next_step(&state(Phase::Completed), false).contains("Completed"));
     }
 
     #[test]
@@ -203,7 +207,7 @@ mod tests {
         // "made in place" case; the point is that Failed and Blocked must carry it too, not that
         // this fixture exercises every commitment variant.
         for phase in [Phase::Failed, Phase::Blocked, Phase::Completed] {
-            let next = next_step(&state(phase));
+            let next = next_step(&state(phase), false);
             assert!(
                 next.contains("changes were made in place"),
                 "phase {phase:?} omits the outcome hint:\n{next}"
